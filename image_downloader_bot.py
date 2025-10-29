@@ -15,6 +15,7 @@ from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Update, Message, InputMediaPhoto
+from pyrogram.raw.functions.channels import CreateForumTopic
 import aiosqlite
 from fastapi import FastAPI
 import uvicorn
@@ -492,15 +493,23 @@ async def handle_down(client: Client, message: Message):
     if create_topics_per_user:
         for username in username_images.keys():
             try:
-                topic = await client.create_forum_topic(target_chat_id, f"Media - {username}")
-                user_topic_ids[username] = topic.message_thread_id
+                # Use raw API to create forum topic
+                result = await client.invoke(CreateForumTopic(
+                    channel=await client.resolve_peer(target_chat_id),
+                    title=f"Media - {username.replace('_', ' ')}"
+                ))
+                user_topic_ids[username] = result.id
             except Exception as e:
                 logger.error(f"Failed to create topic for {username}: {str(e)}")
                 user_topic_ids[username] = None
     elif create_topic_name:
         try:
-            topic = await client.create_forum_topic(target_chat_id, create_topic_name)
-            target_topic_id = topic.message_thread_id
+            # Use raw API to create forum topic
+            result = await client.invoke(CreateForumTopic(
+                channel=await client.resolve_peer(target_chat_id),
+                title=create_topic_name
+            ))
+            target_topic_id = result.id
         except Exception as e:
             await message.reply(f"Failed to create topic: {str(e)}")
             return
