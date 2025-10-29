@@ -8,14 +8,15 @@ import html
 import gc
 import logging
 import aioshutil
+import random
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from pyrogram import Client, filters
-from pyrogram.types import Update, Message, InputMediaPhoto
-from pyrogram.raw.functions.channels import CreateForumTopic
+from pyrogram.types import Update, Message
+from pyrogram.enums import ChatType
 import aiosqlite
 from fastapi import FastAPI
 import uvicorn
@@ -52,7 +53,6 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(1)  # Limit concurrent sends to prevent rate limits
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -209,8 +209,20 @@ async def download_batch(urls, temp_dir, base_timeout=5):
     failed = [url for url, r in zip(urls, results) if r is None]
     return successful, failed
 
-async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, batch_num=1):
-    """Send batch of images using Pyrogram, split into groups of 10"""
+async def create_forum_topic(token, chat_id, name):
+    """Create forum topic using Telegram API"""
+    url = f"https://api.telegram.org/bot{token}/createForumTopic"
+    data = {"chat_id": chat_id, "name": name}
+    async with httpx.AsyncClient() as client:
+        r = await client.post(url, data=data)
+        if r.status_code == 200:
+            result = r.json()
+            if result.get("ok"):
+                return result["result"]["message_thread_id"]
+    return None
+
+async def send_image_batch_api(token, images, username, chat_id, topic_id=None, batch_num=1):
+    """Send batch of images using Telegram API, split into groups of 10"""
     if not images:
         return False
 
@@ -218,36 +230,49 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     chunk_size = 10
     chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
 
-    # Send chunks concurrently but limited
-    send_tasks = []
     for idx, chunk in enumerate(chunks):
-        async def send_chunk(idx, chunk):
-            async with SEND_SEMAPHORE:
-                try:
-                    media = []
-                    current_batch_num = batch_num + idx
-                    for i, img in enumerate(chunk):
-                        if i == 0:
-                            media.append(InputMediaPhoto(img['path'], caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
-                        else:
-                            media.append(InputMediaPhoto(img['path']))
+        files = {}
+        try:
+            current_batch_num = batch_num + idx
+            media = []
+            for i, img in enumerate(chunk):
+                attach_name = f"file{i}"
+                media_item = {
+                    "type": "photo",
+                    "media": f"attach://{attach_name}"
+                }
+                if i == 0:
+                    media_item["caption"] = f"{username.replace('_', ' ')} - {current_batch_num}"
+                media.append(media_item)
+                files[attach_name] = open(img['path'], 'rb')
 
-                    if topic_id:
-                        await bot.send_media_group(chat_id, media, message_thread_id=topic_id)
-                    else:
-                        await bot.send_media_group(chat_id, media)
-                except Exception as e:
-                    logger.error(f"Error sending chunk {idx} for {username}: {str(e)}")
-                    raise
+            url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+            data = {"chat_id": chat_id, "media": json.dumps(media)}
+            if topic_id:
+                data["message_thread_id"] = topic_id
 
-        send_tasks.append(send_chunk(idx, chunk))
+            async with httpx.AsyncClient() as client:
+                r = await client.post(url, data=data, files=files)
 
-    # Execute all sends concurrently with semaphore limiting
-    results = await asyncio.gather(*send_tasks, return_exceptions=True)
-    for idx, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"Error sending chunk {idx} for {username}: {str(result)}")
+            if r.status_code == 200:
+                result = r.json()
+                if not result.get("ok"):
+                    logger.error(f"API error sending chunk {idx} for {username}: {result}")
+                    return False
+            else:
+                logger.error(f"HTTP error sending chunk {idx} for {username}: {r.status_code} - {r.text}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error sending chunk {idx} for {username}: {str(e)}")
             return False
+        finally:
+            for f in files.values():
+                try:
+                    f.close()
+                except:
+                    pass
+
     return True
 
 def cleanup_images(images):
@@ -327,7 +352,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             for username, imgs in username_groups.items():
                 user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
                 batch_num_user = username_batch_nums.get(username, 1)
-                send_tasks.append(send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user))
+                send_tasks.append(send_image_batch_api(BOT_TOKEN, imgs, username, chat_id, user_topic, batch_num_user))
             results = await asyncio.gather(*send_tasks, return_exceptions=True)
             for (username, imgs), success in zip(username_groups.items(), results):
                 if isinstance(success, bool) and success:
@@ -392,7 +417,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 for username, imgs in username_groups.items():
                     user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
                     batch_num_user = username_batch_nums.get(username, 1)
-                    success = await send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user)
+                    success = await send_image_batch_api(BOT_TOKEN, imgs, username, chat_id, user_topic, batch_num_user)
                     if success:
                         num_chunks = (len(imgs) + 9) // 10
                         username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
@@ -490,28 +515,30 @@ async def handle_down(client: Client, message: Message):
 
     # Handle topic creation
     user_topic_ids = {}
+    if create_topics_per_user or create_topic_name:
+        # Check if the target chat is a supergroup
+        try:
+            chat = await client.get_chat(target_chat_id)
+            logger.info(f"Chat info - ID: {chat.id}, Type: {chat.type}, Title: {chat.title}, Is Forum: {getattr(chat, 'is_forum', 'N/A')}")
+            if chat.type != ChatType.SUPERGROUP:
+                await message.reply("❌ Error: The target must be a supergroup.")
+                return
+        except Exception as e:
+            await message.reply(f"❌ Error: Cannot access the target group. Make sure the bot is added to the group. Details: {str(e)}")
+            return
+
     if create_topics_per_user:
         for username in username_images.keys():
-            try:
-                # Use raw API to create forum topic
-                result = await client.invoke(CreateForumTopic(
-                    channel=await client.resolve_peer(target_chat_id),
-                    title=f"Media - {username.replace('_', ' ')}"
-                ))
-                user_topic_ids[username] = result.id
-            except Exception as e:
-                logger.error(f"Failed to create topic for {username}: {str(e)}")
+            topic_id = await create_forum_topic(BOT_TOKEN, target_chat_id, f"{username.replace('_', ' ')}")
+            if topic_id:
+                user_topic_ids[username] = topic_id
+            else:
+                logger.error(f"Failed to create topic for {username}")
                 user_topic_ids[username] = None
     elif create_topic_name:
-        try:
-            # Use raw API to create forum topic
-            result = await client.invoke(CreateForumTopic(
-                channel=await client.resolve_peer(target_chat_id),
-                title=create_topic_name
-            ))
-            target_topic_id = result.id
-        except Exception as e:
-            await message.reply(f"Failed to create topic: {str(e)}")
+        target_topic_id = await create_forum_topic(BOT_TOKEN, target_chat_id, create_topic_name)
+        if not target_topic_id:
+            await message.reply(f"Failed to create topic: {create_topic_name}")
             return
 
     # Send initial progress
