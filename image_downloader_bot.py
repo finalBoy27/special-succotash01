@@ -43,12 +43,12 @@ threading.Thread(target=run_fastapi, daemon=True).start()
 # ⚙️ CONFIG
 # ───────────────────────────────
 TIMEOUT = 15.0
-DELAY_BETWEEN_REQUESTS = 0.2
+DELAY_BETWEEN_REQUESTS = 0.3
 TEMP_DB = "Scraping/tempImages.db"
 MAX_CONCURRENT_WORKERS = 10
 MAX_RETRIES = 3
 RETRY_DELAY = 2
-DOWNLOAD_TIMEOUT = 20.0
+DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
 SEND_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent sends to prevent timeouts
@@ -171,9 +171,10 @@ async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETR
     async with semaphore:
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)  # Add delay between requests
         for attempt in range(1, max_retries + 1):
+            current_timeout = 5 + (attempt - 1) * 5  # 5s, 10s, 15s for attempts
             try:
                 async with httpx.AsyncClient() as client:
-                    r = await client.get(url, timeout=timeout)
+                    r = await client.get(url, timeout=current_timeout)
                     if r.status_code == 200:
                         content = r.content
                         if len(content) > 100:  # Basic size check
@@ -198,10 +199,10 @@ async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETR
         logger.error(f"Failed to download after {max_retries} attempts: {url}")
         return None
 
-async def download_batch(urls, temp_dir):
+async def download_batch(urls, temp_dir, base_timeout=5):
     """Download batch of URLs concurrently"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    tasks = [download_image(url, temp_dir, semaphore) for url in urls]
+    tasks = [download_image(url, temp_dir, semaphore, base_timeout=base_timeout) for url in urls]
     results = await asyncio.gather(*tasks)
     successful = [r for r in results if r is not None]
     failed = [url for url, r in zip(urls, results) if r is None]
@@ -347,7 +348,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             batch_num = (i // BATCH_SIZE) + 1
             total_batches = (len(failed_urls) + BATCH_SIZE - 1) // BATCH_SIZE
 
-            downloaded, _ = await download_batch(batch_urls, temp_dir)
+            downloaded, _ = await download_batch(batch_urls, temp_dir, base_timeout=10)
 
             if downloaded:
                 # Group and send
