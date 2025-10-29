@@ -51,7 +51,7 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent sends to prevent timeouts
+SEND_SEMAPHORE = asyncio.Semaphore(1)  # Limit concurrent sends to prevent rate limits
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -259,7 +259,7 @@ def cleanup_images(images):
             logger.warning(f"Error cleaning up {img['path']}: {str(e)}")
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
-    """Process all URLs in batches of BATCH_SIZE"""
+    """Process all URLs in dynamic batches of BATCH_SIZE successful downloads"""
     total_images = sum(len(urls) for urls in username_images.values())
     total_downloaded = 0
     total_sent = 0
@@ -276,31 +276,40 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     for username in username_images:
         all_urls.extend(username_images[username])
 
-    # Process in batches
-    for i in range(0, len(all_urls), BATCH_SIZE):
-        batch_urls = all_urls[i:i + BATCH_SIZE]
-        batch_num = (i // BATCH_SIZE) + 1
-        total_batches = (len(all_urls) + BATCH_SIZE - 1) // BATCH_SIZE
+    url_index = 0
+    batch_num = 1
+
+    while url_index < len(all_urls):
+        batch_successful = []
+        
+        # Fill batch with successful downloads
+        while len(batch_successful) < BATCH_SIZE and url_index < len(all_urls):
+            current_url = all_urls[url_index]
+            
+            # Try to download with retries
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+            downloaded = await download_image(current_url, temp_dir, semaphore)
+            if downloaded:
+                batch_successful.append(downloaded)
+            else:
+                failed_urls.append(current_url)
+            
+            url_index += 1
 
         # Update progress
         now = time.time()
         if now - last_edit[0] > 3:
-            progress_percent = int((i / len(all_urls)) * 100)
+            progress_percent = int((url_index / len(all_urls)) * 100)
             bar = generate_bar(progress_percent)
-            progress = f"completed {batch_num}/{total_batches}\n{bar} {progress_percent}%\n📥 Downloading batch {batch_num}..."
+            progress = f"completed {batch_num}\n{bar} {progress_percent}%\n📥 Processing batch {batch_num}..."
             if progress_msg:
                 await progress_msg.edit(progress)
             last_edit[0] = now
 
-        # Download batch
-        downloaded, batch_failed = await download_batch(batch_urls, temp_dir)
-        failed_urls.extend(batch_failed)
-        total_downloaded += len(downloaded)
-
-        if downloaded:
+        if batch_successful:
             # Group by username for sending
             username_groups = {}
-            for img in downloaded:
+            for img in batch_successful:
                 # Find username for this URL
                 username = None
                 for u, urls in username_images.items():
@@ -327,13 +336,16 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 else:
                     failed_urls.extend([img['url'] for img in imgs])
 
+            total_downloaded += len(batch_successful)
+            batch_num += 1
+
             # Cleanup
-            cleanup_images(downloaded)
-            del downloaded, username_groups, send_tasks, results
+            cleanup_images(batch_successful)
+            del batch_successful, username_groups, send_tasks, results
             log_memory()
             gc.collect()
 
-    # Now process failed URLs
+    # Now process failed URLs with same dynamic logic
     if failed_urls:
         logger.info(f"Processing {len(failed_urls)} failed URLs")
         now = time.time()
@@ -343,17 +355,29 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 await progress_msg.edit(progress)
             last_edit[0] = now
 
-        for i in range(0, len(failed_urls), BATCH_SIZE):
-            batch_urls = failed_urls[i:i + BATCH_SIZE]
-            batch_num = (i // BATCH_SIZE) + 1
-            total_batches = (len(failed_urls) + BATCH_SIZE - 1) // BATCH_SIZE
+        failed_index = 0
+        retry_batch_num = 1
+        
+        while failed_index < len(failed_urls):
+            batch_successful = []
+            
+            # Fill retry batch
+            while len(batch_successful) < BATCH_SIZE and failed_index < len(failed_urls):
+                current_url = failed_urls[failed_index]
+                
+                # Try download with extended timeout
+                semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+                downloaded = await download_image(current_url, temp_dir, semaphore, base_timeout=10)
+                if downloaded:
+                    batch_successful.append(downloaded)
+                # No need to add to failed again
+                
+                failed_index += 1
 
-            downloaded, _ = await download_batch(batch_urls, temp_dir, base_timeout=10)
-
-            if downloaded:
+            if batch_successful:
                 # Group and send
                 username_groups = {}
-                for img in downloaded:
+                for img in batch_successful:
                     username = None
                     for u, urls in username_images.items():
                         if img['url'] in urls:
@@ -373,8 +397,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                         username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
                         total_sent += len(imgs)
 
-                cleanup_images(downloaded)
-                del downloaded, username_groups
+                total_downloaded += len(batch_successful)
+                retry_batch_num += 1
+
+                cleanup_images(batch_successful)
+                del batch_successful, username_groups
                 log_memory()
                 gc.collect()
 
