@@ -51,7 +51,7 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 20.0
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent sends to prevent timeouts
+SEND_SEMAPHORE = asyncio.Semaphore(5)  # Increased for faster sending
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -70,6 +70,25 @@ logger = logging.getLogger(__name__)
 
 # Suppress Pyrogram connection logs
 logging.getLogger('pyrogram').setLevel(logging.WARNING)
+
+def get_usage_message():
+    return """❌ Usage:
+• `/down <url>` - Send media to current chat
+• `/down <url> -g <chat_id>` - Send media to specific group
+• `/down <url> -g <chat_id> -t <topic_id>` - Send media to specific topic
+• `/down <url> -g <chat_id> -ct "topic_name"` - Create topic and send there
+• `/down <url> -g <chat_id> -u` - Create topics for each username
+• Reply to HTML file with `/down`
+• Reply to message with URLs with `/down`
+
+📋 Examples:
+• `/down https://catbox.moe/file.html`
+• `/down https://catbox.moe/file.html -g -1001234567890`
+• `/down https://catbox.moe/file.html -g -1001234567890 -t 1234`
+• `/down https://catbox.moe/file.html -g -1001234567890 -ct "My Gallery"`
+• `/down https://catbox.moe/file.html -g -1001234567890 -u`
+
+✨ New: Images grouped by username with exactly 5 per batch!"""
 
 def log_memory():
     try:
@@ -166,13 +185,15 @@ def filter_and_deduplicate_urls(username_images):
 
     return filtered_username_images, all_urls
 
-async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, timeout=DOWNLOAD_TIMEOUT):
+async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, base_timeout=10):
     """Download single image with retries"""
     async with semaphore:
         for attempt in range(1, max_retries + 1):
+            # Increase timeout with each attempt: base_timeout + 5*attempt
+            attempt_timeout = base_timeout + attempt * 5
             try:
                 async with httpx.AsyncClient() as client:
-                    r = await client.get(url, timeout=timeout)
+                    r = await client.get(url, timeout=attempt_timeout)
                     if r.status_code == 200:
                         content = r.content
                         if len(content) > 100:  # Basic size check
@@ -197,10 +218,10 @@ async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETR
         logger.error(f"Failed to download after {max_retries} attempts: {url}")
         return None
 
-async def download_batch(urls, temp_dir):
+async def download_batch(urls, temp_dir, base_timeout=10):
     """Download batch of URLs concurrently"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    tasks = [download_image(url, temp_dir, semaphore) for url in urls]
+    tasks = [download_image(url, temp_dir, semaphore, base_timeout=base_timeout) for url in urls]
     results = await asyncio.gather(*tasks)
     successful = [r for r in results if r is not None]
     failed = [url for url, r in zip(urls, results) if r is None]
@@ -211,8 +232,8 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     if not images:
         return False
 
-    # Split into chunks of 10
-    chunk_size = 10
+    # Split into chunks of 5 (smaller for faster uploads)
+    chunk_size = 5
     chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
 
     # Send chunks concurrently but limited
@@ -319,7 +340,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             results = await asyncio.gather(*send_tasks, return_exceptions=True)
             for (username, imgs), success in zip(username_groups.items(), results):
                 if isinstance(success, bool) and success:
-                    num_chunks = (len(imgs) + 9) // 10
+                    num_chunks = (len(imgs) + 4) // 5  # Updated for chunk_size=5
                     username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
                     total_sent += len(imgs)
                 else:
@@ -346,7 +367,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             batch_num = (i // BATCH_SIZE) + 1
             total_batches = (len(failed_urls) + BATCH_SIZE - 1) // BATCH_SIZE
 
-            downloaded, _ = await download_batch(batch_urls, temp_dir)
+            downloaded, _ = await download_batch(batch_urls, temp_dir, base_timeout=15)  # Longer timeouts for retries
 
             if downloaded:
                 # Group and send
@@ -367,7 +388,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     batch_num_user = username_batch_nums.get(username, 1)
                     success = await send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user)
                     if success:
-                        num_chunks = (len(imgs) + 9) // 10
+                        num_chunks = (len(imgs) + 4) // 5  # Updated for chunk_size=5
                         username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
                         total_sent += len(imgs)
 
@@ -393,6 +414,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
 async def handle_down(client: Client, message: Message):
     text = message.text.strip()
     args = text.split()[1:] if len(text.split()) > 1 else []
+
+    # Check for usage
+    if not args and not message.reply_to_message:
+        await message.reply(get_usage_message())
+        return
 
     # Parse arguments
     url = None
