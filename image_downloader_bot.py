@@ -169,6 +169,7 @@ def filter_and_deduplicate_urls(username_images):
 async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, timeout=DOWNLOAD_TIMEOUT):
     """Download single image with retries"""
     async with semaphore:
+        await asyncio.sleep(DELAY_BETWEEN_REQUESTS)  # Add delay between requests
         for attempt in range(1, max_retries + 1):
             try:
                 async with httpx.AsyncClient() as client:
