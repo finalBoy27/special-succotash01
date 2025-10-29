@@ -51,6 +51,7 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 20.0
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
+SEND_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent sends to prevent timeouts
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -214,27 +215,31 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     chunk_size = 10
     chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
 
-    # Send chunks concurrently
+    # Send chunks concurrently but limited
     send_tasks = []
     for idx, chunk in enumerate(chunks):
-        try:
-            media = []
-            current_batch_num = batch_num + idx
-            for i, img in enumerate(chunk):
-                if i == 0:
-                    media.append(InputMediaPhoto(img['path'], caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
-                else:
-                    media.append(InputMediaPhoto(img['path']))
+        async def send_chunk(idx, chunk):
+            async with SEND_SEMAPHORE:
+                try:
+                    media = []
+                    current_batch_num = batch_num + idx
+                    for i, img in enumerate(chunk):
+                        if i == 0:
+                            media.append(InputMediaPhoto(img['path'], caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
+                        else:
+                            media.append(InputMediaPhoto(img['path']))
 
-            if topic_id:
-                send_tasks.append(bot.send_media_group(chat_id, media, message_thread_id=topic_id))
-            else:
-                send_tasks.append(bot.send_media_group(chat_id, media))
-        except Exception as e:
-            logger.error(f"Error preparing chunk {idx} for {username}: {str(e)}")
-            return False
+                    if topic_id:
+                        await bot.send_media_group(chat_id, media, message_thread_id=topic_id)
+                    else:
+                        await bot.send_media_group(chat_id, media)
+                except Exception as e:
+                    logger.error(f"Error sending chunk {idx} for {username}: {str(e)}")
+                    raise
 
-    # Execute all sends concurrently
+        send_tasks.append(send_chunk(idx, chunk))
+
+    # Execute all sends concurrently with semaphore limiting
     results = await asyncio.gather(*send_tasks, return_exceptions=True)
     for idx, result in enumerate(results):
         if isinstance(result, Exception):
