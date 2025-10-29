@@ -1,0 +1,8 @@
+httpx
+selectolax
+pyrogram
+aiosqlite
+fastapi
+uvicorn
+aioshutil
+psutil
