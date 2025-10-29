@@ -166,7 +166,7 @@ def filter_and_deduplicate_urls(username_images):
 
     return filtered_username_images, all_urls
 
-async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, timeout=DOWNLOAD_TIMEOUT):
+async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, base_timeout=5):
     """Download single image with retries"""
     async with semaphore:
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)  # Add delay between requests
