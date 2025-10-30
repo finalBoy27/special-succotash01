@@ -54,14 +54,14 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(3)  # Limit concurrent sends to prevent rate limits
+SEND_SEMAPHORE = asyncio.Semaphore(2)  # Limit concurrent sends to prevent rate limits
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
 
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7564190075:AAEV0Uz3DRuIAAfNJKF2IpzaOQBRYxSo4eg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAENHUiCvvLjN_2wjfstNZSfB5i_XISu3Ho")
 
 bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -225,7 +225,7 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     for idx, chunk in enumerate(chunks):
         async def send_chunk(idx, chunk):
             async with SEND_SEMAPHORE:
-                await asyncio.sleep(0.2)  # Delay between sends to avoid rate limits
+                await asyncio.sleep(0.5)  # Delay between sends to avoid rate limits
                 try:
                     media = []
                     current_batch_num = batch_num + idx
