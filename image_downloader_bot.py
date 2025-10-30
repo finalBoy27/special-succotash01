@@ -8,6 +8,7 @@ import html
 import gc
 import logging
 import aioshutil
+import random
 from urllib.parse import urlencode, urljoin
 from selectolax.parser import HTMLParser
 from datetime import datetime
@@ -234,7 +235,7 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                             media.append(InputMediaPhoto(img['path']))
 
                     if topic_id:
-                        await bot.send_media_group(chat_id, media, message_thread_id=topic_id)
+                        await bot.send_media_group(chat_id, media, reply_to_message_id=topic_id)
                     else:
                         await bot.send_media_group(chat_id, media)
                 except FloodWait as e:
@@ -242,7 +243,7 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                     await asyncio.sleep(e.value)
                     # Retry once after wait
                     if topic_id:
-                        await bot.send_media_group(chat_id, media, message_thread_id=topic_id)
+                        await bot.send_media_group(chat_id, media, reply_to_message_id=topic_id)
                     else:
                         await bot.send_media_group(chat_id, media)
                 except Exception as e:
@@ -291,21 +292,16 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     batch_num = 1
 
     while url_index < len(all_urls):
-        batch_successful = []
-        
-        # Fill batch with successful downloads
-        while len(batch_successful) < BATCH_SIZE and url_index < len(all_urls):
-            current_url = all_urls[url_index]
-            
-            # Try to download with retries
-            semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-            downloaded = await download_image(current_url, temp_dir, semaphore)
-            if downloaded:
-                batch_successful.append(downloaded)
-            else:
-                failed_urls.append(current_url)
-            
+        # Collect up to BATCH_SIZE URLs for concurrent download
+        batch_urls = []
+        while len(batch_urls) < BATCH_SIZE and url_index < len(all_urls):
+            batch_urls.append(all_urls[url_index])
             url_index += 1
+        
+        # Download the batch concurrently
+        successful, failed = await download_batch(batch_urls, temp_dir)
+        batch_successful = successful
+        failed_urls.extend(failed)
 
         # Update progress
         now = time.time()
@@ -364,7 +360,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             log_memory()
             gc.collect()
 
-    # Now process failed URLs with same dynamic logic
+    # Now process failed URLs with same concurrent logic
     if failed_urls:
         logger.info(f"Processing {len(failed_urls)} failed URLs")
         now = time.time()
@@ -387,20 +383,15 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         retry_batch_num = 1
         
         while failed_index < len(failed_urls):
-            batch_successful = []
-            
-            # Fill retry batch
-            while len(batch_successful) < BATCH_SIZE and failed_index < len(failed_urls):
-                current_url = failed_urls[failed_index]
-                
-                # Try download with extended timeout
-                semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-                downloaded = await download_image(current_url, temp_dir, semaphore, base_timeout=10)
-                if downloaded:
-                    batch_successful.append(downloaded)
-                # No need to add to failed again
-                
+            # Collect up to BATCH_SIZE failed URLs for concurrent retry
+            batch_urls = []
+            while len(batch_urls) < BATCH_SIZE and failed_index < len(failed_urls):
+                batch_urls.append(failed_urls[failed_index])
                 failed_index += 1
+            
+            # Retry download concurrently with extended timeout
+            successful, _ = await download_batch(batch_urls, temp_dir, base_timeout=10)
+            batch_successful = successful
 
             if batch_successful:
                 # Group and send
@@ -442,6 +433,77 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     gc.collect()
 
     return total_downloaded, total_sent, total_images
+
+# ───────────────────────────────
+# ✅ FIXED TOPIC CREATION FUNCTION
+# ───────────────────────────────
+async def create_forum_topic(client: Client, chat_id: int, topic_name: str):
+    """Create a forum topic and return its ID"""
+    try:
+        # Verify bot can access the chat
+        try:
+            chat = await client.get_chat(chat_id)
+            logger.info(f"📣 Connected to chat: {chat.title}")
+        except Exception:
+            logger.info("ℹ️ Chat not found in cache. Sending handshake message...")
+            await client.send_message(chat_id, "👋 Bot connected successfully!")
+            chat = await client.get_chat(chat_id)
+        
+        # Create the forum topic
+        peer = await client.resolve_peer(chat_id)
+        random_id = random.randint(100000, 999999999)
+        
+        result = await client.invoke(
+            CreateForumTopic(
+                channel=peer,
+                title=topic_name,
+                random_id=random_id,
+                icon_color=0xFFD700  # optional: gold color
+            )
+        )
+        
+        # Extract topic_id
+        topic_id = None
+        for update in result.updates:
+            if hasattr(update, "message") and hasattr(update.message, "id"):
+                topic_id = update.message.id
+                break
+        
+        if not topic_id:
+            logger.error("⚠️ Could not detect topic_id. Check permissions.")
+            return None
+        
+        logger.info(f"🆕 Topic created: {topic_name} (ID: {topic_id})")
+        return topic_id
+        
+    except Exception as e:
+        logger.error(f"❌ Error creating topic '{topic_name}': {str(e)}")
+        return None
+
+# ───────────────────────────────
+# 🔍 HELPER: GET CHAT ID
+# ───────────────────────────────
+@bot.on_message(filters.command("getid"))
+async def get_chat_id(client: Client, message: Message):
+    """Get the chat ID of current chat or forwarded message"""
+    if message.forward_from_chat:
+        chat = message.forward_from_chat
+        await message.reply(
+            f"**Forwarded Chat Info:**\n"
+            f"• Title: {chat.title}\n"
+            f"• ID: `{chat.id}`\n"
+            f"• Type: {chat.type}\n"
+            f"• Is Forum: {getattr(chat, 'is_forum', False)}"
+        )
+    else:
+        chat = message.chat
+        await message.reply(
+            f"**Current Chat Info:**\n"
+            f"• Title: {getattr(chat, 'title', 'Private Chat')}\n"
+            f"• ID: `{chat.id}`\n"
+            f"• Type: {chat.type}\n"
+            f"• Is Forum: {getattr(chat, 'is_forum', False)}"
+        )
 
 # ───────────────────────────────
 # BOT HANDLER
@@ -515,30 +577,20 @@ async def handle_down(client: Client, message: Message):
         await message.reply("No valid images found.")
         return
 
-    # Handle topic creation
+    # Handle topic creation with improved logic
     user_topic_ids = {}
     if create_topics_per_user:
+        logger.info(f"Creating {len(username_images)} topics for users...")
         for username in username_images.keys():
-            try:
-                # Use raw API to create forum topic
-                result = await client.invoke(CreateForumTopic(
-                    channel=await client.resolve_peer(target_chat_id),
-                    title=f"Media - {username.replace('_', ' ')}"
-                ))
-                user_topic_ids[username] = result.id
-            except Exception as e:
-                logger.error(f"Failed to create topic for {username}: {str(e)}")
-                user_topic_ids[username] = None
+            topic_name = f"Media - {username.replace('_', ' ')}"
+            topic_id = await create_forum_topic(client, target_chat_id, topic_name)
+            user_topic_ids[username] = topic_id
+            await asyncio.sleep(0.5)  # Small delay between topic creations
     elif create_topic_name:
-        try:
-            # Use raw API to create forum topic
-            result = await client.invoke(CreateForumTopic(
-                channel=await client.resolve_peer(target_chat_id),
-                title=create_topic_name
-            ))
-            target_topic_id = result.id
-        except Exception as e:
-            await message.reply(f"Failed to create topic: {str(e)}")
+        logger.info(f"Creating single topic: {create_topic_name}")
+        target_topic_id = await create_forum_topic(client, target_chat_id, create_topic_name)
+        if not target_topic_id:
+            await message.reply(f"Failed to create topic '{create_topic_name}'. Check bot permissions.")
             return
 
     # Send initial progress
