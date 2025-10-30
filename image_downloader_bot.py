@@ -61,7 +61,7 @@ EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
 
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAENHUiCvvLjN_2wjfstNZSfB5i_XISu3Ho")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7564190075:AAEV0Uz3DRuIAAfNJKF2IpzaOQBRYxSo4eg")
 
 bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -620,3 +620,4 @@ async def handle_down(client: Client, message: Message):
 if __name__ == "__main__":
     threading.Thread(target=run_fastapi, daemon=True).start()
     bot.run()
+
