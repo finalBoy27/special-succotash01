@@ -35,7 +35,7 @@ def health():
     return {"status": "OK"}
 
 def run_fastapi():
-    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 10001)))
+    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv("PORT", 10000)))
 
 # Disable FastAPI logs if needed, but for now keep
 logging.getLogger('uvicorn').disabled = True  # optional
@@ -54,7 +54,7 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(2)  # Limit concurrent sends to prevent rate limits
+SEND_SEMAPHORE = asyncio.Semaphore(1)  # Limit concurrent sends to prevent rate limits
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -220,12 +220,11 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     chunk_size = 10
     chunks = [images[i:i + chunk_size] for i in range(0, len(images), chunk_size)]
 
-    # Send chunks concurrently but limited
-    send_tasks = []
+    # Send chunks sequentially to avoid rate limits
     for idx, chunk in enumerate(chunks):
         async def send_chunk(idx, chunk):
             async with SEND_SEMAPHORE:
-                await asyncio.sleep(0.5)  # Delay between sends to avoid rate limits
+                await asyncio.sleep(1.0)  # Increased delay between sends to avoid rate limits
                 try:
                     media = []
                     current_batch_num = batch_num + idx
@@ -251,14 +250,8 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                     logger.error(f"Error sending chunk {idx} for {username}: {str(e)}")
                     raise
 
-        send_tasks.append(send_chunk(idx, chunk))
+        await send_chunk(idx, chunk)  # Await sequentially
 
-    # Execute all sends concurrently with semaphore limiting
-    results = await asyncio.gather(*send_tasks, return_exceptions=True)
-    for idx, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"Error sending chunk {idx} for {username}: {str(result)}")
-            return False
     return True
 
 def cleanup_images(images):
@@ -583,7 +576,7 @@ async def handle_down(client: Client, message: Message):
     if create_topics_per_user:
         logger.info(f"Creating {len(username_images)} topics for users...")
         for username in username_images.keys():
-            topic_name = f"Media - {username.replace('_', ' ')}"
+            topic_name = f"{username.replace('_', ' ')}"
             topic_id = await create_forum_topic(client, target_chat_id, topic_name)
             user_topic_ids[username] = topic_id
             await asyncio.sleep(0.5)  # Small delay between topic creations
@@ -620,4 +613,3 @@ async def handle_down(client: Client, message: Message):
 if __name__ == "__main__":
     threading.Thread(target=run_fastapi, daemon=True).start()
     bot.run()
-
