@@ -16,6 +16,7 @@ from io import BytesIO
 from pyrogram import Client, filters
 from pyrogram.types import Update, Message, InputMediaPhoto
 from pyrogram.raw.functions.channels import CreateForumTopic
+from pyrogram.errors import FloodWait
 import aiosqlite
 from fastapi import FastAPI
 import uvicorn
@@ -236,6 +237,14 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                         await bot.send_media_group(chat_id, media, message_thread_id=topic_id)
                     else:
                         await bot.send_media_group(chat_id, media)
+                except FloodWait as e:
+                    logger.warning(f"FloodWait on send for {username} chunk {idx}: waiting {e.value} seconds")
+                    await asyncio.sleep(e.value)
+                    # Retry once after wait
+                    if topic_id:
+                        await bot.send_media_group(chat_id, media, message_thread_id=topic_id)
+                    else:
+                        await bot.send_media_group(chat_id, media)
                 except Exception as e:
                     logger.error(f"Error sending chunk {idx} for {username}: {str(e)}")
                     raise
@@ -271,6 +280,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     os.makedirs(temp_dir, exist_ok=True)
 
     last_edit = [0]
+    last_progress_percent = [0]  # Track last reported percentage
 
     # Collect all URLs in order
     all_urls = []
@@ -299,13 +309,21 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
 
         # Update progress
         now = time.time()
-        if now - last_edit[0] > 3:
-            progress_percent = int((url_index / len(all_urls)) * 100)
+        progress_percent = int((url_index / len(all_urls)) * 100) if all_urls else 100
+        if (now - last_edit[0] > 10) and (progress_percent - last_progress_percent[0] >= 5):  # Increased delay + percentage threshold
             bar = generate_bar(progress_percent)
             progress = f"completed {batch_num}\n{bar} {progress_percent}%\n📥 Processing batch {batch_num}..."
             if progress_msg:
-                await progress_msg.edit(progress)
+                try:
+                    await progress_msg.edit(progress)
+                except FloodWait as e:
+                    logger.warning(f"FloodWait on progress edit: waiting {e.value} seconds")
+                    await asyncio.sleep(e.value)  # Wait and retry once
+                    await progress_msg.edit(progress)
+                except Exception as e:
+                    logger.error(f"Error editing progress message: {str(e)}")
             last_edit[0] = now
+            last_progress_percent[0] = progress_percent
 
         if batch_successful:
             # Group by username for sending
@@ -350,11 +368,20 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     if failed_urls:
         logger.info(f"Processing {len(failed_urls)} failed URLs")
         now = time.time()
-        if now - last_edit[0] > 3:
+        progress_percent = 100  # Assume full progress for retry phase
+        if (now - last_edit[0] > 10) and (progress_percent - last_progress_percent[0] >= 5):
             progress = f"🔄 Retrying {len(failed_urls)} failed URLs..."
             if progress_msg:
-                await progress_msg.edit(progress)
+                try:
+                    await progress_msg.edit(progress)
+                except FloodWait as e:
+                    logger.warning(f"FloodWait on retry progress edit: waiting {e.value} seconds")
+                    await asyncio.sleep(e.value)
+                    await progress_msg.edit(progress)
+                except Exception as e:
+                    logger.error(f"Error editing retry progress message: {str(e)}")
             last_edit[0] = now
+            last_progress_percent[0] = progress_percent
 
         failed_index = 0
         retry_batch_num = 1
