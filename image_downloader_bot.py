@@ -60,19 +60,11 @@ VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
 ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
-# Load session if available
-session_string = None
-try:
-    with open("bot_session.txt", "r") as f:
-        session_string = f.read().strip()
-except FileNotFoundError:
-    pass
-
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBROqw")
 
-bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=session_string)
+bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
@@ -363,7 +355,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         # Update progress
         now = time.time()
         progress_percent = int((url_index / len(all_urls)) * 100) if all_urls else 100
-        if (now - last_edit[0] > 20) and (progress_percent - last_progress_percent[0] >= 10):
+        if (now - last_edit[0] > 10) and (progress_percent - last_progress_percent[0] >= 5):
             bar = generate_bar(progress_percent)
             progress = f"completed {batch_num}\n{bar} {progress_percent}%\n📥 Processing batch {batch_num}... (Accumulated: {len(accumulated_successful)})"
             if progress_msg:
@@ -603,23 +595,15 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-async def main():
+if __name__ == "__main__":
     threading.Thread(target=run_fastapi, daemon=True).start()
     while True:
         try:
-            await bot.start()
-            # Save session after successful start
-            session_string = await bot.export_session_string()
-            with open("bot_session.txt", "w") as f:
-                f.write(session_string)
-            await bot.idle()
+            bot.run()
             break  # Exit if successful
         except FloodWait as e:
             logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
-            await asyncio.sleep(e.value)
+            time.sleep(e.value)
         except Exception as e:
             logger.error(f"Error starting bot: {e}")
             break
-
-if __name__ == "__main__":
-    asyncio.run(main())
