@@ -62,14 +62,9 @@ ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEh4r-xp-TxqRx_6qL-dc8xJwvXXlaLOpE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBROqw")
 
-try:
-    with open("bot_session.txt", "r") as f:
-        session_string = f.read().strip()
-    bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=session_string)
-except FileNotFoundError:
-    bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
@@ -600,25 +595,15 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-async def main():
+if __name__ == "__main__":
     threading.Thread(target=run_fastapi, daemon=True).start()
     while True:
         try:
-            await bot.start()
-            session_string = await bot.export_session_string()
-            with open("bot_session.txt", "w") as f:
-                f.write(session_string)
-            await bot.run_until_disconnected()
-            # If we reach here, bot disconnected cleanly
-            break
+            bot.run()
+            break  # Exit if successful
         except FloodWait as e:
             logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
-            await asyncio.sleep(e.value)
+            time.sleep(e.value)
         except Exception as e:
             logger.error(f"Error starting bot: {e}")
-            # Optionally, add a delay before retry
-            await asyncio.sleep(5)
-            continue  # Retry instead of break
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            break
