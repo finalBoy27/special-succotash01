@@ -60,11 +60,19 @@ VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
 ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
+# Load session if available
+session_string = None
+try:
+    with open("bot_session.txt", "r") as f:
+        session_string = f.read().strip()
+except FileNotFoundError:
+    pass
+
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBROqw")
 
-bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=session_string)
 
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
@@ -595,15 +603,23 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-if __name__ == "__main__":
+async def main():
     threading.Thread(target=run_fastapi, daemon=True).start()
     while True:
         try:
-            bot.run()
+            await bot.start()
+            # Save session after successful start
+            session_string = await bot.export_session_string()
+            with open("bot_session.txt", "w") as f:
+                f.write(session_string)
+            await bot.idle()
             break  # Exit if successful
         except FloodWait as e:
             logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
-            time.sleep(e.value)
+            await asyncio.sleep(e.value)
         except Exception as e:
             logger.error(f"Error starting bot: {e}")
             break
+
+if __name__ == "__main__":
+    asyncio.run(main())
