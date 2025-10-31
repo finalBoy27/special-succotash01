@@ -62,7 +62,7 @@ ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAENHUiCvvLjN_2wjfstNZSfB5i_XISu3Ho")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEh4r-xp-TxqRx_6qL-dc8xJwvXXlaLOpE")
 
 try:
     with open("bot_session.txt", "r") as f:
@@ -600,22 +600,25 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-if __name__ == "__main__":
-    async def main():
-        threading.Thread(target=run_fastapi, daemon=True).start()
-        while True:
-            try:
-                await bot.start()
-                session_string = await bot.export_session_string()
-                with open("bot_session.txt", "w") as f:
-                    f.write(session_string)
-                await bot.run_until_disconnected()
-                break  # Exit if successful
-            except FloodWait as e:
-                logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
-                await asyncio.sleep(e.value)
-            except Exception as e:
-                logger.error(f"Error starting bot: {e}")
-                break
+async def main():
+    threading.Thread(target=run_fastapi, daemon=True).start()
+    while True:
+        try:
+            await bot.start()
+            session_string = await bot.export_session_string()
+            with open("bot_session.txt", "w") as f:
+                f.write(session_string)
+            await bot.run_until_disconnected()
+            # If we reach here, bot disconnected cleanly
+            break
+        except FloodWait as e:
+            logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            # Optionally, add a delay before retry
+            await asyncio.sleep(5)
+            continue  # Retry instead of break
 
+if __name__ == "__main__":
     asyncio.run(main())
