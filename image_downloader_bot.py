@@ -48,13 +48,13 @@ threading.Thread(target=run_fastapi, daemon=True).start()
 TIMEOUT = 15.0
 DELAY_BETWEEN_REQUESTS = 0.3
 TEMP_DB = "Scraping/tempImages.db"
-MAX_CONCURRENT_WORKERS = 10
+MAX_CONCURRENT_WORKERS = 10  # Reduced for lower CPU usage on free tier
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
-BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(1)  # Increased to allow more concurrent sends
+BATCH_SIZE = 10  # Reduced for lower memory usage
+SEND_SEMAPHORE = asyncio.Semaphore(1)  # Allow 2 concurrent sends for speed without overloading
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -69,11 +69,10 @@ bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
 # ───────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Suppress Pyrogram connection logs
-logging.getLogger('pyrogram').setLevel(logging.WARNING)
+# logging.getLogger('pyrogram').setLevel(logging.WARNING)
 
 def log_memory():
     try:
@@ -170,8 +169,8 @@ def filter_and_deduplicate_urls(username_images):
 
     return filtered_username_images, all_urls
 
-async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, base_timeout=5):
-    """Download single image with retries"""
+async def download_image(url, semaphore, max_retries=MAX_DOWNLOAD_RETRIES, base_timeout=5):
+    """Download single image with retries, return bytes"""
     async with semaphore:
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)  # Add delay between requests
         for attempt in range(1, max_retries + 1):
@@ -182,12 +181,7 @@ async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETR
                     if r.status_code == 200:
                         content = r.content
                         if len(content) > 100:  # Basic size check
-                            # Save to temp file
-                            filename = f"temp_{int(time.time() * 1000000)}_{len(content)}.jpg"
-                            filepath = os.path.join(temp_dir, filename)
-                            with open(filepath, 'wb') as f:
-                                f.write(content)
-                            return {'url': url, 'path': filepath, 'content': content}
+                            return {'url': url, 'content': content}
                         else:
                             logger.warning(f"Image too small: {url}")
                             return None
@@ -203,10 +197,10 @@ async def download_image(url, temp_dir, semaphore, max_retries=MAX_DOWNLOAD_RETR
         logger.error(f"Failed to download after {max_retries} attempts: {url}")
         return None
 
-async def download_batch(urls, temp_dir, base_timeout=5):
+async def download_batch(urls, base_timeout=5):
     """Download batch of URLs concurrently"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
-    tasks = [download_image(url, temp_dir, semaphore, base_timeout=base_timeout) for url in urls]
+    tasks = [download_image(url, semaphore, base_timeout=base_timeout) for url in urls]
     results = await asyncio.gather(*tasks)
     successful = [r for r in results if r is not None]
     failed = [url for url, r in zip(urls, results) if r is None]
@@ -225,15 +219,15 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     for idx, chunk in enumerate(chunks):
         async def send_chunk(idx, chunk):
             async with SEND_SEMAPHORE:
-                await asyncio.sleep(0.5)  # Reduced delay for faster sending
+                await asyncio.sleep(1.0)  # Balanced delay for speed without floods
                 try:
                     media = []
                     current_batch_num = batch_num + idx
                     for i, img in enumerate(chunk):
                         if i == 0:
-                            media.append(InputMediaPhoto(img['path'], caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
+                            media.append(InputMediaPhoto(img['content'], caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
                         else:
-                            media.append(InputMediaPhoto(img['path']))
+                            media.append(InputMediaPhoto(img['content']))
 
                     if topic_id:
                         await bot.send_media_group(chat_id, media, reply_to_message_id=topic_id)
@@ -256,13 +250,8 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     return True
 
 def cleanup_images(images):
-    """Remove temp image files"""
-    for img in images:
-        try:
-            if os.path.exists(img['path']):
-                os.remove(img['path'])
-        except Exception as e:
-            logger.warning(f"Error cleaning up {img['path']}: {str(e)}")
+    """No cleanup needed for in-memory images"""
+    pass
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
     """Process all URLs in dynamic send batches of BATCH_SIZE successful downloads"""
@@ -271,9 +260,6 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     total_sent = 0
     failed_urls = []
     username_batch_nums = {}
-
-    temp_dir = "temp_images"
-    os.makedirs(temp_dir, exist_ok=True)
 
     last_edit = [0]
     last_progress_percent = [0]  # Track last reported percentage
@@ -299,7 +285,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 failed_urls = failed_urls[num_to_take:]
                 is_from_failed = True
 
-            successful, failed = await download_batch(batch_urls, temp_dir)
+            successful, failed = await download_batch(batch_urls)
             successful_for_send.extend(successful)
             if not is_from_failed:
                 failed_urls.extend(failed)
@@ -308,11 +294,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         if not successful_for_send:
             break
 
-        # Update progress
+        # Update progress less frequently to save CPU
         processed = total_downloaded + len(successful_for_send)
         progress_percent = int((processed / total_images) * 100) if total_images else 100
         now = time.time()
-        if (now - last_edit[0] > 20) and (progress_percent - last_progress_percent[0] >= 10):  # Increased delay + percentage threshold
+        if (now - last_edit[0] > 30) and (progress_percent - last_progress_percent[0] >= 20):  # Less frequent updates
             bar = generate_bar(progress_percent)
             progress = f"completed {send_batch_num}\n{bar} {progress_percent}%\n📥 Processing send batch {send_batch_num}..."
             if progress_msg:
@@ -341,7 +327,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     username_groups[username] = []
                 username_groups[username].append(img)
 
-        # Send groups concurrently
+        # Send groups concurrently but limited
         send_tasks = []
         for username, imgs in username_groups.items():
             user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
@@ -357,18 +343,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         total_downloaded += len(successful_for_send)
         send_batch_num += 1
 
-        # Cleanup
-        cleanup_images(successful_for_send)
+        # Aggressive memory cleanup
         del successful_for_send, username_groups, send_tasks, results
-        log_memory()
         gc.collect()
 
-    # Cleanup temp dir
-    try:
-        await aioshutil.rmtree(temp_dir)
-    except:
-        pass
-    log_memory()
+    # No temp dir to cleanup
     gc.collect()
 
     return total_downloaded, total_sent, total_images
