@@ -14,7 +14,7 @@ from selectolax.parser import HTMLParser
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import Update, Message, InputMediaPhoto
 from pyrogram.raw.functions.channels import CreateForumTopic
 from pyrogram.errors import FloodWait
@@ -600,14 +600,22 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-
-async def main():
-    threading.Thread(target=run_fastapi, daemon=True).start()
-    await bot.start()
-    session_string = await bot.export_session_string()
-    with open("bot_session.txt", "w") as f:
-        f.write(session_string)
-    await idle()
-
 if __name__ == "__main__":
+    async def main():
+        threading.Thread(target=run_fastapi, daemon=True).start()
+        while True:
+            try:
+                await bot.start()
+                session_string = await bot.export_session_string()
+                with open("bot_session.txt", "w") as f:
+                    f.write(session_string)
+                await bot.run_until_disconnected()
+                break  # Exit if successful
+            except FloodWait as e:
+                logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
+                await asyncio.sleep(e.value)
+            except Exception as e:
+                logger.error(f"Error starting bot: {e}")
+                break
+
     asyncio.run(main())
