@@ -54,7 +54,7 @@ RETRY_DELAY = 2
 DOWNLOAD_TIMEOUT = 10
 MAX_DOWNLOAD_RETRIES = 3
 BATCH_SIZE = 10
-SEND_SEMAPHORE = asyncio.Semaphore(1)  # Limit concurrent sends to prevent rate limits
+SEND_SEMAPHORE = asyncio.Semaphore(1)  # Increased to allow more concurrent sends
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
@@ -225,7 +225,7 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
     for idx, chunk in enumerate(chunks):
         async def send_chunk(idx, chunk):
             async with SEND_SEMAPHORE:
-                await asyncio.sleep(1.0)  # Increased delay between sends to avoid rate limits
+                await asyncio.sleep(0.5)  # Reduced delay for faster sending
                 try:
                     media = []
                     current_batch_num = batch_num + idx
@@ -265,10 +265,11 @@ def cleanup_images(images):
             logger.warning(f"Error cleaning up {img['path']}: {str(e)}")
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
-    """Process all URLs in dynamic batches of BATCH_SIZE successful downloads"""
+    """Process all URLs in dynamic send batches of BATCH_SIZE successful downloads"""
     total_images = sum(len(urls) for urls in username_images.values())
     total_downloaded = 0
     total_sent = 0
+    failed_urls = []
     username_batch_nums = {}
 
     temp_dir = "temp_images"
@@ -278,103 +279,58 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     last_progress_percent = [0]  # Track last reported percentage
 
     # Collect all URLs in order
-    all_urls = []
+    pending_urls = []
     for username in username_images:
-        all_urls.extend(username_images[username])
+        pending_urls.extend(username_images[username])
 
-    url_index = 0
-    batch_num = 1
-    accumulated_successful = []  # List of successful images
+    send_batch_num = 1
 
-    while url_index < len(all_urls):
-        # If we have 10 accumulated, send them
-        if len(accumulated_successful) >= 10:
-            # Group by username
-            username_groups = {}
-            for img in accumulated_successful[:10]:
-                # Find username for this URL
-                username = None
-                for u, urls in username_images.items():
-                    if img['url'] in urls:
-                        username = u
-                        break
-                if username:
-                    if username not in username_groups:
-                        username_groups[username] = []
-                    username_groups[username].append(img)
+    while pending_urls or failed_urls:
+        successful_for_send = []
+        while len(successful_for_send) < BATCH_SIZE and (pending_urls or failed_urls):
+            if pending_urls:
+                num_to_take = min(BATCH_SIZE - len(successful_for_send), len(pending_urls))
+                batch_urls = pending_urls[:num_to_take]
+                pending_urls = pending_urls[num_to_take:]
+                is_from_failed = False
+            else:
+                num_to_take = min(BATCH_SIZE - len(successful_for_send), len(failed_urls))
+                batch_urls = failed_urls[:num_to_take]
+                failed_urls = failed_urls[num_to_take:]
+                is_from_failed = True
 
-            # Send groups concurrently
-            send_tasks = []
-            for username, imgs in username_groups.items():
-                user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
-                batch_num_user = username_batch_nums.get(username, 1)
-                send_tasks.append(send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user))
-            results = await asyncio.gather(*send_tasks, return_exceptions=True)
-            sent_count = 0
-            for (username, imgs), success in zip(username_groups.items(), results):
-                if isinstance(success, bool) and success:
-                    num_chunks = (len(imgs) + 9) // 10
-                    username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
-                    sent_count += len(imgs)
-                else:
-                    # If send failed, keep them? But for now, assume success
-                    pass
-            total_sent += sent_count
-
-            # Remove sent from accumulated
-            sent_images = accumulated_successful[:10]
-            accumulated_successful = accumulated_successful[10:]
-            batch_num += 1
-
-            # Cleanup sent images
-            cleanup_images(sent_images)
-            log_memory()
-            gc.collect()
-
-        # Now, if we need more, download next batch
-        if len(accumulated_successful) < 10 and url_index < len(all_urls):
-            # Take up to 10 URLs, but since we want to fill, take min(10, remaining)
-            batch_size = min(10, len(all_urls) - url_index)
-            batch_urls = all_urls[url_index:url_index + batch_size]
-            url_index += batch_size
-
-            # Download
             successful, failed = await download_batch(batch_urls, temp_dir)
-            # Add successful to accumulated
-            accumulated_successful.extend(successful)
-            total_downloaded += len(successful)
+            successful_for_send.extend(successful)
+            if not is_from_failed:
+                failed_urls.extend(failed)
+            # Else, discard failed from failed_urls
 
-            # Retry failed immediately
-            if failed:
-                # Retry with extended timeout
-                retry_successful, still_failed = await download_batch(failed, temp_dir, base_timeout=10)
-                accumulated_successful.extend(retry_successful)
-                total_downloaded += len(retry_successful)
-                # still_failed are discarded
+        if not successful_for_send:
+            break
 
         # Update progress
+        processed = total_downloaded + len(successful_for_send)
+        progress_percent = int((processed / total_images) * 100) if total_images else 100
         now = time.time()
-        progress_percent = int((url_index / len(all_urls)) * 100) if all_urls else 100
-        if (now - last_edit[0] > 10) and (progress_percent - last_progress_percent[0] >= 5):
+        if (now - last_edit[0] > 20) and (progress_percent - last_progress_percent[0] >= 10):  # Increased delay + percentage threshold
             bar = generate_bar(progress_percent)
-            progress = f"completed {batch_num}\n{bar} {progress_percent}%\n📥 Processing batch {batch_num}... (Accumulated: {len(accumulated_successful)})"
+            progress = f"completed {send_batch_num}\n{bar} {progress_percent}%\n📥 Processing send batch {send_batch_num}..."
             if progress_msg:
                 try:
                     await progress_msg.edit(progress)
                 except FloodWait as e:
                     logger.warning(f"FloodWait on progress edit: waiting {e.value} seconds")
-                    await asyncio.sleep(e.value)
+                    await asyncio.sleep(e.value)  # Wait and retry once
                     await progress_msg.edit(progress)
                 except Exception as e:
                     logger.error(f"Error editing progress message: {str(e)}")
             last_edit[0] = now
             last_progress_percent[0] = progress_percent
 
-    # After loop, if any remaining accumulated <10, send them
-    if accumulated_successful:
-        # Send remaining
+        # Group by username for sending
         username_groups = {}
-        for img in accumulated_successful:
+        for img in successful_for_send:
+            # Find username for this URL
             username = None
             for u, urls in username_images.items():
                 if img['url'] in urls:
@@ -385,21 +341,25 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     username_groups[username] = []
                 username_groups[username].append(img)
 
+        # Send groups concurrently
         send_tasks = []
         for username, imgs in username_groups.items():
             user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
             batch_num_user = username_batch_nums.get(username, 1)
             send_tasks.append(send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user))
         results = await asyncio.gather(*send_tasks, return_exceptions=True)
-        sent_count = 0
         for (username, imgs), success in zip(username_groups.items(), results):
             if isinstance(success, bool) and success:
                 num_chunks = (len(imgs) + 9) // 10
                 username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
-                sent_count += len(imgs)
-        total_sent += sent_count
+                total_sent += len(imgs)
 
-        cleanup_images(accumulated_successful)
+        total_downloaded += len(successful_for_send)
+        send_batch_num += 1
+
+        # Cleanup
+        cleanup_images(successful_for_send)
+        del successful_for_send, username_groups, send_tasks, results
         log_memory()
         gc.collect()
 
@@ -462,7 +422,7 @@ async def create_forum_topic(client: Client, chat_id: int, topic_name: str):
 # ───────────────────────────────
 # 🔍 HELPER: GET CHAT ID
 # ───────────────────────────────
-@bot.on_message(filters.command("getid") & filters.chat(list(ALLOWED_CHAT_IDS)) & filters.private)
+@bot.on_message(filters.command("getid"))
 async def get_chat_id(client: Client, message: Message):
     """Get the chat ID of current chat or forwarded message"""
     if message.forward_from_chat:
@@ -487,8 +447,11 @@ async def get_chat_id(client: Client, message: Message):
 # ───────────────────────────────
 # BOT HANDLER
 # ───────────────────────────────
-@bot.on_message(filters.command("down") & filters.chat(list(ALLOWED_CHAT_IDS)) & filters.private)
+@bot.on_message(filters.command("down") & filters.private)
 async def handle_down(client: Client, message: Message):
+    if message.chat.id not in ALLOWED_CHAT_IDS:
+        return  # Silently ignore if not allowed
+
     text = message.text.strip()
     args = text.split()[1:] if len(text.split()) > 1 else []
 
@@ -600,10 +563,10 @@ if __name__ == "__main__":
     while True:
         try:
             bot.run()
-            break  # Exit if successful
+            break
         except FloodWait as e:
             logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
             time.sleep(e.value)
         except Exception as e:
-            logger.error(f"Error starting bot: {e}")
+            logger.error(f"Bot failed to start: {e}")
             break
