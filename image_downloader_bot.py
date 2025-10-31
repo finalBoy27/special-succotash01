@@ -225,9 +225,9 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                     current_batch_num = batch_num + idx
                     for i, img in enumerate(chunk):
                         if i == 0:
-                            media.append(InputMediaPhoto(img['content'], caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
+                            media.append(InputMediaPhoto(BytesIO(img['content']), caption=f"{username.replace('_', ' ')} - {current_batch_num}"))
                         else:
-                            media.append(InputMediaPhoto(img['content']))
+                            media.append(InputMediaPhoto(BytesIO(img['content'])))
 
                     if topic_id:
                         await bot.send_media_group(chat_id, media, reply_to_message_id=topic_id)
