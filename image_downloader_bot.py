@@ -58,12 +58,18 @@ SEND_SEMAPHORE = asyncio.Semaphore(1)  # Limit concurrent sends to prevent rate 
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
+ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7564190075:AAEV0Uz3DRuIAAfNJKF2IpzaOQBRYxSo4eg")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAENHUiCvvLjN_2wjfstNZSfB5i_XISu3Ho")
 
-bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+try:
+    with open("bot_session.txt", "r") as f:
+        session_string = f.read().strip()
+    bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=session_string)
+except FileNotFoundError:
+    bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
 # 🧩 LOGGING SETUP
@@ -268,7 +274,6 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     total_images = sum(len(urls) for urls in username_images.values())
     total_downloaded = 0
     total_sent = 0
-    failed_urls = []
     username_batch_nums = {}
 
     temp_dir = "temp_images"
@@ -284,41 +289,14 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
 
     url_index = 0
     batch_num = 1
+    accumulated_successful = []  # List of successful images
 
     while url_index < len(all_urls):
-        # Collect up to BATCH_SIZE URLs for concurrent download
-        batch_urls = []
-        while len(batch_urls) < BATCH_SIZE and url_index < len(all_urls):
-            batch_urls.append(all_urls[url_index])
-            url_index += 1
-        
-        # Download the batch concurrently
-        successful, failed = await download_batch(batch_urls, temp_dir)
-        batch_successful = successful
-        failed_urls.extend(failed)
-
-        # Update progress
-        now = time.time()
-        progress_percent = int((url_index / len(all_urls)) * 100) if all_urls else 100
-        if (now - last_edit[0] > 10) and (progress_percent - last_progress_percent[0] >= 5):  # Increased delay + percentage threshold
-            bar = generate_bar(progress_percent)
-            progress = f"completed {batch_num}\n{bar} {progress_percent}%\n📥 Processing batch {batch_num}..."
-            if progress_msg:
-                try:
-                    await progress_msg.edit(progress)
-                except FloodWait as e:
-                    logger.warning(f"FloodWait on progress edit: waiting {e.value} seconds")
-                    await asyncio.sleep(e.value)  # Wait and retry once
-                    await progress_msg.edit(progress)
-                except Exception as e:
-                    logger.error(f"Error editing progress message: {str(e)}")
-            last_edit[0] = now
-            last_progress_percent[0] = progress_percent
-
-        if batch_successful:
-            # Group by username for sending
+        # If we have 10 accumulated, send them
+        if len(accumulated_successful) >= 10:
+            # Group by username
             username_groups = {}
-            for img in batch_successful:
+            for img in accumulated_successful[:10]:
                 # Find username for this URL
                 username = None
                 for u, urls in username_images.items():
@@ -337,86 +315,98 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 batch_num_user = username_batch_nums.get(username, 1)
                 send_tasks.append(send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user))
             results = await asyncio.gather(*send_tasks, return_exceptions=True)
+            sent_count = 0
             for (username, imgs), success in zip(username_groups.items(), results):
                 if isinstance(success, bool) and success:
                     num_chunks = (len(imgs) + 9) // 10
                     username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
-                    total_sent += len(imgs)
+                    sent_count += len(imgs)
                 else:
-                    failed_urls.extend([img['url'] for img in imgs])
+                    # If send failed, keep them? But for now, assume success
+                    pass
+            total_sent += sent_count
 
-            total_downloaded += len(batch_successful)
+            # Remove sent from accumulated
+            sent_images = accumulated_successful[:10]
+            accumulated_successful = accumulated_successful[10:]
             batch_num += 1
 
-            # Cleanup
-            cleanup_images(batch_successful)
-            del batch_successful, username_groups, send_tasks, results
+            # Cleanup sent images
+            cleanup_images(sent_images)
             log_memory()
             gc.collect()
 
-    # Now process failed URLs with same concurrent logic
-    if failed_urls:
-        logger.info(f"Processing {len(failed_urls)} failed URLs")
+        # Now, if we need more, download next batch
+        if len(accumulated_successful) < 10 and url_index < len(all_urls):
+            # Take up to 10 URLs, but since we want to fill, take min(10, remaining)
+            batch_size = min(10, len(all_urls) - url_index)
+            batch_urls = all_urls[url_index:url_index + batch_size]
+            url_index += batch_size
+
+            # Download
+            successful, failed = await download_batch(batch_urls, temp_dir)
+            # Add successful to accumulated
+            accumulated_successful.extend(successful)
+            total_downloaded += len(successful)
+
+            # Retry failed immediately
+            if failed:
+                # Retry with extended timeout
+                retry_successful, still_failed = await download_batch(failed, temp_dir, base_timeout=10)
+                accumulated_successful.extend(retry_successful)
+                total_downloaded += len(retry_successful)
+                # still_failed are discarded
+
+        # Update progress
         now = time.time()
-        progress_percent = 100  # Assume full progress for retry phase
-        if (now - last_edit[0] > 10) and (progress_percent - last_progress_percent[0] >= 5):
-            progress = f"🔄 Retrying {len(failed_urls)} failed URLs..."
+        progress_percent = int((url_index / len(all_urls)) * 100) if all_urls else 100
+        if (now - last_edit[0] > 20) and (progress_percent - last_progress_percent[0] >= 10):
+            bar = generate_bar(progress_percent)
+            progress = f"completed {batch_num}\n{bar} {progress_percent}%\n📥 Processing batch {batch_num}... (Accumulated: {len(accumulated_successful)})"
             if progress_msg:
                 try:
                     await progress_msg.edit(progress)
                 except FloodWait as e:
-                    logger.warning(f"FloodWait on retry progress edit: waiting {e.value} seconds")
+                    logger.warning(f"FloodWait on progress edit: waiting {e.value} seconds")
                     await asyncio.sleep(e.value)
                     await progress_msg.edit(progress)
                 except Exception as e:
-                    logger.error(f"Error editing retry progress message: {str(e)}")
+                    logger.error(f"Error editing progress message: {str(e)}")
             last_edit[0] = now
             last_progress_percent[0] = progress_percent
 
-        failed_index = 0
-        retry_batch_num = 1
-        
-        while failed_index < len(failed_urls):
-            # Collect up to BATCH_SIZE failed URLs for concurrent retry
-            batch_urls = []
-            while len(batch_urls) < BATCH_SIZE and failed_index < len(failed_urls):
-                batch_urls.append(failed_urls[failed_index])
-                failed_index += 1
-            
-            # Retry download concurrently with extended timeout
-            successful, _ = await download_batch(batch_urls, temp_dir, base_timeout=10)
-            batch_successful = successful
+    # After loop, if any remaining accumulated <10, send them
+    if accumulated_successful:
+        # Send remaining
+        username_groups = {}
+        for img in accumulated_successful:
+            username = None
+            for u, urls in username_images.items():
+                if img['url'] in urls:
+                    username = u
+                    break
+            if username:
+                if username not in username_groups:
+                    username_groups[username] = []
+                username_groups[username].append(img)
 
-            if batch_successful:
-                # Group and send
-                username_groups = {}
-                for img in batch_successful:
-                    username = None
-                    for u, urls in username_images.items():
-                        if img['url'] in urls:
-                            username = u
-                            break
-                    if username:
-                        if username not in username_groups:
-                            username_groups[username] = []
-                        username_groups[username].append(img)
+        send_tasks = []
+        for username, imgs in username_groups.items():
+            user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+            batch_num_user = username_batch_nums.get(username, 1)
+            send_tasks.append(send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user))
+        results = await asyncio.gather(*send_tasks, return_exceptions=True)
+        sent_count = 0
+        for (username, imgs), success in zip(username_groups.items(), results):
+            if isinstance(success, bool) and success:
+                num_chunks = (len(imgs) + 9) // 10
+                username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
+                sent_count += len(imgs)
+        total_sent += sent_count
 
-                for username, imgs in username_groups.items():
-                    user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
-                    batch_num_user = username_batch_nums.get(username, 1)
-                    success = await send_image_batch_pyrogram(imgs, username, chat_id, user_topic, batch_num_user)
-                    if success:
-                        num_chunks = (len(imgs) + 9) // 10
-                        username_batch_nums[username] = username_batch_nums.get(username, 1) + num_chunks
-                        total_sent += len(imgs)
-
-                total_downloaded += len(batch_successful)
-                retry_batch_num += 1
-
-                cleanup_images(batch_successful)
-                del batch_successful, username_groups
-                log_memory()
-                gc.collect()
+        cleanup_images(accumulated_successful)
+        log_memory()
+        gc.collect()
 
     # Cleanup temp dir
     try:
@@ -477,7 +467,7 @@ async def create_forum_topic(client: Client, chat_id: int, topic_name: str):
 # ───────────────────────────────
 # 🔍 HELPER: GET CHAT ID
 # ───────────────────────────────
-@bot.on_message(filters.command("getid"))
+@bot.on_message(filters.command("getid") & filters.chat(list(ALLOWED_CHAT_IDS)) & filters.private)
 async def get_chat_id(client: Client, message: Message):
     """Get the chat ID of current chat or forwarded message"""
     if message.forward_from_chat:
@@ -502,7 +492,7 @@ async def get_chat_id(client: Client, message: Message):
 # ───────────────────────────────
 # BOT HANDLER
 # ───────────────────────────────
-@bot.on_message(filters.command("down") & filters.private)
+@bot.on_message(filters.command("down") & filters.chat(list(ALLOWED_CHAT_IDS)) & filters.private)
 async def handle_down(client: Client, message: Message):
     text = message.text.strip()
     args = text.split()[1:] if len(text.split()) > 1 else []
@@ -610,6 +600,26 @@ async def handle_down(client: Client, message: Message):
 # ───────────────────────────────
 # MAIN
 # ───────────────────────────────
-if __name__ == "__main__":
+
+async def main():
     threading.Thread(target=run_fastapi, daemon=True).start()
-    bot.run()
+    while True:
+        try:
+            await bot.start()
+            session_string = await bot.export_session_string()
+            with open("bot_session.txt", "w") as f:
+                f.write(session_string)
+            await bot.run_until_disconnected()
+            # If we reach here, bot disconnected cleanly
+            break
+        except FloodWait as e:
+            logger.warning(f"FloodWait on bot start: waiting {e.value} seconds")
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            logger.error(f"Error starting bot: {e}")
+            # Optionally, add a delay before retry
+            await asyncio.sleep(5)
+            continue  # Retry instead of break
+
+if __name__ == "__main__":
+    asyncio.run(main())
