@@ -7,3 +7,4 @@ uvicorn
 aioshutil
 psutil
 TgCrypto
+Pillow
