@@ -22,6 +22,7 @@ import aiosqlite
 from fastapi import FastAPI
 import uvicorn
 import threading
+from PIL import Image
 
 # Health check app
 app = FastAPI()
@@ -70,7 +71,15 @@ PROGRESS_PERCENT_THRESHOLD = 10   # Minimum % change to trigger update
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
 VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
 EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
-MIN_IMAGE_SIZE = 100            # Minimum image size in bytes
+MIN_IMAGE_SIZE = 100            # Minimum image size in bytes (reduced to accept tiny images)
+MAX_IMAGE_SIZE = 20 * 1024 * 1024  # Maximum image size (20MB - Telegram's actual limit)
+
+# Image Validation Configuration (More permissive for maximum compatibility)
+MIN_IMAGE_WIDTH = 1             # Accept 1px minimum width
+MIN_IMAGE_HEIGHT = 1            # Accept 1px minimum height  
+MAX_IMAGE_WIDTH = 20000         # Increased max width
+MAX_IMAGE_HEIGHT = 20000        # Increased max height
+MAX_ASPECT_RATIO = 50           # More lenient aspect ratio (was 20)
 
 # Memory Management Configuration
 TEMP_DIR_NAME = "temp_images"    # Temporary directory for downloads
@@ -108,6 +117,106 @@ def generate_bar(percentage):
     filled = int(percentage / 10)
     empty = 10 - filled
     return "●" * filled + "○" * (empty // 2) + "◌" * (empty - empty // 2)
+
+def validate_image_for_telegram(filepath):
+    """Validate image dimensions and format for Telegram compatibility - PERMISSIVE MODE"""
+    try:
+        with Image.open(filepath) as img:
+            width, height = img.size
+            file_size = os.path.getsize(filepath)
+            
+            # Only check absolute minimum requirements for Telegram
+            if file_size < MIN_IMAGE_SIZE:
+                logger.debug(f"Image too small: {file_size} bytes < {MIN_IMAGE_SIZE}")
+                return False, "file_too_small"
+            
+            if file_size > MAX_IMAGE_SIZE:
+                logger.debug(f"Image too large: {file_size} bytes > {MAX_IMAGE_SIZE}")
+                return False, "file_too_large"
+            
+            # Very permissive dimension checks
+            if width < MIN_IMAGE_WIDTH or height < MIN_IMAGE_HEIGHT:
+                logger.debug(f"Image dimensions too small: {width}x{height}")
+                return False, "dimensions_too_small"
+            
+            # Only check extreme cases that would definitely fail
+            if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+                logger.debug(f"Image dimensions too large: {width}x{height}")
+                return False, "dimensions_too_large"
+            
+            # More lenient aspect ratio check
+            if min(width, height) > 0:  # Avoid division by zero
+                aspect_ratio = max(width, height) / min(width, height)
+                if aspect_ratio > MAX_ASPECT_RATIO:
+                    logger.debug(f"Aspect ratio too extreme: {aspect_ratio}")
+                    return False, "aspect_ratio_invalid"
+            
+            # Accept most common image formats (don't be too strict)
+            supported_formats = ['JPEG', 'PNG', 'GIF', 'WEBP', 'BMP', 'TIFF', 'ICO']
+            if img.format and img.format not in supported_formats:
+                logger.debug(f"Potentially unsupported format: {img.format} - trying anyway")
+                # Don't reject, just log - let Telegram decide
+            
+            return True, "valid"
+            
+    except Exception as e:
+        logger.debug(f"Image validation error for {filepath}: {str(e)}")
+        # Don't reject on validation errors - try to send anyway
+        return True, "validation_error_accepted"
+
+def convert_image_for_telegram(filepath):
+    """Convert/optimize image for better Telegram compatibility"""
+    try:
+        with Image.open(filepath) as img:
+            # Get original info
+            width, height = img.size
+            file_size = os.path.getsize(filepath)
+            
+            # Check if conversion is needed
+            needs_conversion = False
+            target_width, target_height = width, height
+            
+            # If dimensions are too large, scale down proportionally
+            if width > MAX_IMAGE_WIDTH or height > MAX_IMAGE_HEIGHT:
+                scale = min(MAX_IMAGE_WIDTH / width, MAX_IMAGE_HEIGHT / height)
+                target_width = int(width * scale)
+                target_height = int(height * scale)
+                needs_conversion = True
+                logger.info(f"Resizing image from {width}x{height} to {target_width}x{target_height}")
+            
+            # If file is too large, we'll compress it
+            if file_size > MAX_IMAGE_SIZE:
+                needs_conversion = True
+                logger.info(f"Compressing large image: {file_size} bytes")
+            
+            # Convert if needed
+            if needs_conversion:
+                # Create new image
+                if target_width != width or target_height != height:
+                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                
+                # Convert to RGB if needed (for JPEG compatibility)
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'P':
+                        img = img.convert('RGBA')
+                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                    img = background
+                
+                # Save with compression
+                quality = 85 if file_size > MAX_IMAGE_SIZE else 95
+                img.save(filepath, 'JPEG', quality=quality, optimize=True)
+                
+                new_size = os.path.getsize(filepath)
+                logger.info(f"Converted image: {file_size} -> {new_size} bytes")
+                
+                return True
+            
+            return False  # No conversion needed
+            
+    except Exception as e:
+        logger.warning(f"Image conversion failed for {filepath}: {str(e)}")
+        return False
 
 # ───────────────────────────────
 # 🧩 UTILITIES
@@ -234,7 +343,33 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         # Clear content from memory immediately
                         del content
                         
-                        return {'url': url, 'path': filepath, 'size': size}
+                        # Validate and convert image for Telegram compatibility
+                        is_valid, reason = validate_image_for_telegram(filepath)
+                        if not is_valid and reason not in ["validation_error_accepted"]:
+                            # Try to convert/fix the image
+                            logger.info(f"Attempting to convert invalid image ({reason}): {url}")
+                            converted = convert_image_for_telegram(filepath)
+                            if converted:
+                                # Re-validate after conversion
+                                is_valid, new_reason = validate_image_for_telegram(filepath)
+                                if is_valid:
+                                    logger.info(f"✅ Image conversion successful: {url}")
+                                else:
+                                    logger.warning(f"❌ Image conversion failed ({new_reason}): {url}")
+                                    try:
+                                        os.remove(filepath)
+                                    except:
+                                        pass
+                                    return None
+                            else:
+                                logger.warning(f"❌ Cannot convert image ({reason}): {url}")
+                                try:
+                                    os.remove(filepath)
+                                except:
+                                    pass
+                                return None
+                        
+                        return {'url': url, 'path': filepath, 'size': os.path.getsize(filepath)}
                     else:
                         logger.debug(f"Image too small ({len(content)} bytes): {url}")
                         return None
@@ -256,12 +391,48 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
         return None
 
 async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, batch_num=1):
-    """Send batch of images using Pyrogram - memory efficient version"""
+    """Send batch of images using Pyrogram - memory efficient version with better error handling"""
     if not images:
         return False
 
+    # Filter out invalid images before sending - but try to convert first
+    valid_images = []
+    for img in images:
+        if isinstance(img, dict) and 'path' in img and os.path.exists(img['path']):
+            is_valid, reason = validate_image_for_telegram(img['path'])
+            if is_valid:
+                valid_images.append(img)
+            else:
+                # Try to convert the image
+                logger.info(f"Attempting to convert image before sending ({reason}): {img['path']}")
+                converted = convert_image_for_telegram(img['path'])
+                if converted:
+                    # Re-validate after conversion
+                    is_valid_after, new_reason = validate_image_for_telegram(img['path'])
+                    if is_valid_after:
+                        logger.info(f"✅ Pre-send conversion successful: {img['path']}")
+                        # Update size after conversion
+                        img['size'] = os.path.getsize(img['path'])
+                        valid_images.append(img)
+                    else:
+                        logger.warning(f"❌ Pre-send conversion failed ({new_reason}): {img['path']}")
+                        try:
+                            os.remove(img['path'])
+                        except:
+                            pass
+                else:
+                    logger.warning(f"❌ Cannot convert image before sending ({reason}): {img['path']}")
+                    try:
+                        os.remove(img['path'])
+                    except:
+                        pass
+
+    if not valid_images:
+        logger.warning(f"No valid images found for {username} batch {batch_num}")
+        return False
+
     # Split into chunks using configurable size
-    chunks = [images[i:i + MEDIA_GROUP_SIZE] for i in range(0, len(images), MEDIA_GROUP_SIZE)]
+    chunks = [valid_images[i:i + MEDIA_GROUP_SIZE] for i in range(0, len(valid_images), MEDIA_GROUP_SIZE)]
     
     successful_chunks = 0
     total_chunks = len(chunks)
@@ -274,9 +445,23 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                 media = []
                 current_batch_num = batch_num + idx
                 
-                # Create media group
+                # Create media group - double check each image
                 for i, img in enumerate(chunk):
                     try:
+                        # Final validation before adding to media group - very permissive
+                        if not os.path.exists(img['path']):
+                            logger.warning(f"Image file not found: {img['path']}")
+                            continue
+                            
+                        # Try one more conversion attempt if needed
+                        is_valid, reason = validate_image_for_telegram(img['path'])
+                        if not is_valid and reason not in ["validation_error_accepted"]:
+                            logger.info(f"Final conversion attempt ({reason}): {img['path']}")
+                            converted = convert_image_for_telegram(img['path'])
+                            if not converted:
+                                logger.warning(f"Final validation failed ({reason}): {img['path']}")
+                                continue
+                            
                         if i == 0:
                             media.append(InputMediaPhoto(img['path'], caption=f"{username.replace('_', ' ')} - B{current_batch_num}"))
                         else:
@@ -289,8 +474,10 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                     logger.warning(f"No valid media created for {username} chunk {idx}")
                     continue
 
-                # Send with retry mechanism
+                # Send with improved retry mechanism
                 max_send_retries = 3
+                retry_delay = 1
+                
                 for attempt in range(max_send_retries):
                     try:
                         if topic_id:
@@ -300,24 +487,68 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                         successful_chunks += 1
                         logger.debug(f"✅ Sent chunk {idx+1}/{total_chunks} for {username}")
                         break
+                        
                     except FloodWait as e:
-                        logger.info(f"🕐 FloodWait {e.value}s for {username} chunk {idx}")
-                        await asyncio.sleep(e.value)
+                        flood_wait_time = min(e.value, 120)  # Cap at 2 minutes
+                        logger.info(f"🕐 FloodWait {flood_wait_time}s for {username} chunk {idx}")
+                        await asyncio.sleep(flood_wait_time)
                         if attempt == max_send_retries - 1:
-                            logger.error(f"❌ FloodWait retry failed for {username} chunk {idx}")
-                            return False
+                            logger.warning(f"❌ FloodWait retry exhausted for {username} chunk {idx}")
+                            # Don't return False, continue with next chunk
+                            break
+                            
                     except Exception as e:
-                        logger.warning(f"Send attempt {attempt+1} failed for {username} chunk {idx}: {str(e)}")
-                        if attempt == max_send_retries - 1:
-                            logger.error(f"❌ All send attempts failed for {username} chunk {idx}")
-                            return False
-                        await asyncio.sleep(1)
+                        error_msg = str(e).lower()
+                        if "photo_invalid_dimensions" in error_msg or "photo_save_file_invalid" in error_msg:
+                            logger.warning(f"Telegram rejected images in {username} chunk {idx}: {str(e)}")
+                            # Try to convert and retry once more
+                            logger.info(f"Attempting final conversion for rejected images: {username} chunk {idx}")
+                            retry_media = []
+                            for media_item in media:
+                                try:
+                                    # Get the file path from the media item
+                                    file_path = media_item.media
+                                    if os.path.exists(file_path):
+                                        converted = convert_image_for_telegram(file_path)
+                                        if converted:
+                                            # Recreate media item with converted image
+                                            if len(retry_media) == 0:
+                                                retry_media.append(InputMediaPhoto(file_path, caption=media_item.caption))
+                                            else:
+                                                retry_media.append(InputMediaPhoto(file_path))
+                                except Exception as conv_e:
+                                    logger.debug(f"Conversion retry failed: {str(conv_e)}")
+                            
+                            if retry_media:
+                                try:
+                                    if topic_id:
+                                        await bot.send_media_group(chat_id, retry_media, reply_to_message_id=topic_id)
+                                    else:
+                                        await bot.send_media_group(chat_id, retry_media)
+                                    successful_chunks += 1
+                                    logger.info(f"✅ Retry successful after conversion for {username} chunk {idx}")
+                                    break
+                                except Exception as retry_e:
+                                    logger.warning(f"Retry after conversion failed: {str(retry_e)}")
+                            
+                            # Skip this chunk if conversion retry also failed
+                            break
+                        else:
+                            logger.warning(f"Send attempt {attempt+1} failed for {username} chunk {idx}: {str(e)}")
+                            if attempt == max_send_retries - 1:
+                                logger.error(f"❌ All send attempts failed for {username} chunk {idx}")
+                                break
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
 
             except Exception as e:
                 logger.error(f"❌ Critical error sending {username} chunk {idx}: {str(e)}")
-                return False
+                continue  # Continue with next chunk instead of failing entirely
 
-    return successful_chunks == total_chunks
+    # Return True if at least some chunks were successful
+    success_rate = successful_chunks / total_chunks if total_chunks > 0 else 0
+    logger.info(f"📊 {username}: {successful_chunks}/{total_chunks} chunks sent successfully ({success_rate:.1%})")
+    return success_rate > 0
 
 def cleanup_images(images):
     """Remove temp image files with error handling"""
@@ -416,7 +647,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                             successfully_sent_urls.update(img['url'] for img in batch_images)
                             logger.info(f"✅ Sent {len(batch_images)} images for {username}")
                         else:
-                            logger.warning(f"❌ Failed to send batch for {username}")
+                            logger.warning(f"⚠️ Partial/failed send for {username} - continuing process")
                     except Exception as e:
                         logger.error(f"❌ Error sending {username} batch: {str(e)}")
                     
@@ -472,6 +703,8 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                         if success:
                             total_sent += len(batch_images)
                             successfully_sent_urls.update(img['url'] for img in batch_images)
+                        else:
+                            logger.warning(f"⚠️ Partial/failed retry send for {username}")
                     except Exception as e:
                         logger.error(f"❌ Retry send error for {username}: {str(e)}")
                     cleanup_images(batch_images)
