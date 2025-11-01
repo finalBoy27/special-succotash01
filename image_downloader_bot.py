@@ -44,77 +44,158 @@ logging.getLogger('uvicorn').disabled = True  # optional
 
 threading.Thread(target=run_fastapi, daemon=True).start()
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⚙️ COMPREHENSIVE CONFIGURATION - ALL SETTINGS IN ONE PLACE
+# ═══════════════════════════════════════════════════════════════════════════
+
 # ───────────────────────────────
-# ⚙️ PERFORMANCE CONFIG
+# 🔐 BOT AUTHENTICATION & ACCESS
 # ───────────────────────────────
-# HTTP & Download Configuration
-MAX_CONCURRENT_WORKERS = 30      # Concurrent download workers - increased for speed
-DELAY_BETWEEN_REQUESTS = 0.03    # Delay between requests (seconds) - optimized for speed
-TIMEOUT = 12.0                   # HTTP request timeout (seconds) - increased for better success
-MAX_DOWNLOAD_RETRIES = 4         # Download retry attempts per URL - increased
-RETRY_DELAY = 0.8                # Delay between retries (seconds) - slightly increased
-
-# Batch Processing Configuration
-BATCH_SIZE = 40                  # URLs processed per download batch - increased for speed
-CHUNK_SIZE = 60                  # URLs per processing chunk - increased for speed
-
-# Telegram Sending Configuration
-SEND_SEMAPHORE = asyncio.Semaphore(6)  # Concurrent sends - increased for speed
-SEND_DELAY = 0.15                # Delay between sends (seconds) - optimized for speed
-MEDIA_GROUP_SIZE = 10            # Images per media group (max 10 for Telegram)
-MAX_SEND_RETRIES = 3             # Send retry attempts per batch
-
-# Progress Update Configuration
-PROGRESS_UPDATE_INTERVAL = 20    # Seconds between progress updates
-PROGRESS_PERCENT_THRESHOLD = 10   # Minimum % change to trigger update
-
-# Content Filtering Configuration
-EXCLUDED_DOMAINS = ["pornbb.xyz"]
-VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif", "gif"]  # Added GIF back
-EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]  # Removed GIF - will convert to image
-VIDEO_DOMAIN_PREFIX = "https://video.desifakes.net/vh/dli?"  # Special domain for video thumbnail extraction
-VIDEO_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]  # Video extensions for thumbnail extraction
-MIN_IMAGE_SIZE = 100            # Minimum image size in bytes (reduced to accept tiny images)
-MAX_IMAGE_SIZE = 20 * 1024 * 1024  # Maximum image size (20MB - Telegram's actual limit)
-
-# Image Validation Configuration (More permissive for maximum compatibility)
-MIN_IMAGE_WIDTH = 1             # Accept 1px minimum width
-MIN_IMAGE_HEIGHT = 1            # Accept 1px minimum height  
-MAX_IMAGE_WIDTH = 20000         # Increased max width
-MAX_IMAGE_HEIGHT = 20000        # Increased max height
-MAX_ASPECT_RATIO = 50           # More lenient aspect ratio (was 20)
-
-# Memory Management Configuration
-TEMP_DIR_NAME = "temp_images"    # Temporary directory for downloads
-CONNECTION_POOL_SIZE = 80        # HTTP keepalive connections - increased for speed
-MAX_CONNECTIONS = 300            # Maximum HTTP connections - increased for speed
-
-# Database Configuration
-DB_NAME = "bot_cache.db"         # SQLite database for caching and tracking
-DB_CACHE_EXPIRY = 24 * 60 * 60   # Cache expiry in seconds (24 hours)
-USE_DATABASE_TRACKING = True     # Enable database-based tracking for memory efficiency
-
-# Access Control
-ALLOWED_CHAT_IDS = {5809601894, 1285451259}
-
 API_ID = int(os.getenv("API_ID", 24536446))
 API_HASH = os.getenv("API_HASH", "baee9dd189e1fd1daf0fb7239f7ae704")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBROqw")
+ALLOWED_CHAT_IDS = {5809601894, 1285451259}  # Users who can use the bot
 
+# ───────────────────────────────
+# 🌐 HTTP & DOWNLOAD SETTINGS
+# ───────────────────────────────
+MAX_CONCURRENT_WORKERS = 30          # Maximum concurrent downloads at once
+DELAY_BETWEEN_REQUESTS = 0.03        # Delay between each download request (seconds)
+TIMEOUT = [10.0, 14.0, 18.0, 20.0]   # HTTP request timeout per attempt (seconds) - grows dynamically
+MAX_DOWNLOAD_RETRIES = 4             # How many times to retry a failed download
+RETRY_DELAY = [0.5, 0.6, 0.7, 0.8]   # Wait time between retries per attempt (seconds) - grows dynamically
+CONNECTION_POOL_SIZE = 80            # HTTP connection pool size for reuse
+MAX_CONNECTIONS = 300                # Maximum total HTTP connections
+
+# ───────────────────────────────
+# 📦 BATCH PROCESSING SETTINGS
+# ───────────────────────────────
+BATCH_SIZE = 40                      # URLs processed per download batch
+CHUNK_SIZE = 60                      # URLs per processing chunk
+BATCH_URLS_COUNT = 10                # Number of URLs to process together
+
+# ───────────────────────────────
+# 📤 TELEGRAM SENDING SETTINGS
+# ───────────────────────────────
+MAX_CONCURRENT_SENDS = 6             # Maximum concurrent sends to Telegram
+SEND_DELAY = 0.15                    # Delay between sends (seconds)
+MEDIA_GROUP_SIZE = 10                # Images per media group (max 10 for Telegram)
+MAX_SEND_RETRIES = 3                 # Send retry attempts per batch
+SEND_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_SENDS)
+
+# ───────────────────────────────
+# 📊 PROGRESS & UI SETTINGS
+# ───────────────────────────────
+PROGRESS_UPDATE_INTERVAL = 20        # Seconds between progress message updates
+PROGRESS_PERCENT_THRESHOLD = 10      # Minimum % change to trigger update
+PROGRESS_UPDATE_DELAY = 5            # Minimum seconds between any progress update
+
+# ───────────────────────────────
+# 🎨 IMAGE VALIDATION SETTINGS
+# ───────────────────────────────
+MIN_IMAGE_SIZE = 100                 # Minimum file size (bytes) - very permissive
+MAX_IMAGE_SIZE = 20 * 1024 * 1024    # Maximum file size (20MB - Telegram limit)
+MIN_IMAGE_WIDTH = 1                  # Minimum width (pixels) - accept tiny images
+MIN_IMAGE_HEIGHT = 1                 # Minimum height (pixels)
+MAX_IMAGE_WIDTH = 20000              # Maximum width (pixels)
+MAX_IMAGE_HEIGHT = 20000             # Maximum height (pixels)
+MAX_ASPECT_RATIO = 50                # Maximum width/height ratio
+
+# ───────────────────────────────
+# 🎬 IMAGE CONVERSION SETTINGS
+# ───────────────────────────────
+# Quality settings for different conversion strategies
+CONVERSION_QUALITY_HIGH = 95         # Strategy 1: High quality
+CONVERSION_QUALITY_MEDIUM = 75       # Strategy 2: Medium quality
+CONVERSION_QUALITY_LOW = 60          # Strategy 3: Low quality (guaranteed compatibility)
+CONVERSION_RESIZE_FACTOR_S2 = 0.8    # Strategy 2: Resize to 80% if needed
+CONVERSION_RESIZE_FACTOR_S3 = 0.6    # Strategy 3: Resize to 60% if needed
+CONVERSION_MAX_WIDTH_S3 = 1920       # Strategy 3: Max width
+CONVERSION_MAX_HEIGHT_S3 = 1080      # Strategy 3: Max height
+
+# ───────────────────────────────
+# 📹 VIDEO & GIF CONVERSION
+# ───────────────────────────────
+VIDEO_DOMAIN_PREFIX = "https://video.desifakes.net/vh/dli?"  # EXACT prefix for downloadable videos
+EXCLUDED_VIDEO_PREFIXES = ["https://video.desifakes.net/vh/dl?"]  # Bad video URLs to exclude
+VIDEO_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]  # Video file extensions
+ENABLE_GIF_CONVERSION = True         # Convert GIFs to static thumbnails
+ENABLE_VIDEO_CONVERSION = True       # Convert videos to thumbnails
+GIF_THUMBNAIL_FORMAT = "PNG"         # Output format for GIF thumbnails (PNG/JPEG)
+VIDEO_THUMBNAIL_FORMAT = "JPEG"      # Output format for video thumbnails (PNG/JPEG)
+VIDEO_THUMBNAIL_QUALITY = 85         # JPEG quality for video thumbnails (1-100)
+
+# ───────────────────────────────
+# 🔍 CONTENT FILTERING
+# ───────────────────────────────
+EXCLUDED_DOMAINS = ["pornbb.xyz"]    # Domains to completely exclude
+VALID_IMAGE_EXTS = [                 # Accepted image extensions
+    "jpg", "jpeg", "png", "webp", 
+    "bmp", "tiff", "svg", "ico", 
+    "avif", "jfif", "gif"
+]
+EXCLUDED_MEDIA_EXTS = [              # Media types to exclude (not convert)
+    # Videos handled separately by VIDEO_DOMAIN_PREFIX
+]
+
+# ───────────────────────────────
+# 💾 MEMORY & STORAGE SETTINGS
+# ───────────────────────────────
+TEMP_DIR_NAME = "temp_images"        # Temporary download directory
+ENABLE_GARBAGE_COLLECTION = True     # Force GC after each batch
+GC_AFTER_DOWNLOAD_BATCH = True       # Run GC after downloading batch
+GC_AFTER_SEND_BATCH = True           # Run GC after sending batch
+GC_AFTER_USER_COMPLETE = True        # Run GC after completing each user
+
+# ───────────────────────────────
+# 🗄️ DATABASE SETTINGS
+# ───────────────────────────────
+DB_NAME = "bot_cache.db"             # SQLite database filename
+DB_CACHE_EXPIRY = 24 * 60 * 60       # Cache expiry (24 hours in seconds)
+DB_OLD_SESSION_CLEANUP_DAYS = 7      # Keep completed sessions for 7 days
+USE_DATABASE_TRACKING = True         # Enable database-based tracking
+
+# ───────────────────────────────
+# 🔄 RETRY & ERROR HANDLING
+# ───────────────────────────────
+MAX_URL_RETRY_ATTEMPTS = 2           # Max retries per URL (total attempts)
+ENABLE_DOWNLOAD_RETRY = True         # Enable retry for failed downloads
+ENABLE_SEND_RETRY = True             # Enable retry for failed sends
+FLOODWAIT_SAFETY_MARGIN = 2          # Extra seconds to add to FloodWait delay
+
+# ───────────────────────────────
+# 📝 LOGGING SETTINGS
+# ───────────────────────────────
+LOG_LEVEL = logging.INFO             # Logging level (DEBUG, INFO, WARNING, ERROR)
+LOG_MEMORY_USAGE = True              # Log memory statistics
+LOG_DETAILED_GC_STATS = False        # Log detailed garbage collection stats (debug only)
+SUPPRESS_PYROGRAM_LOGS = True        # Suppress Pyrogram connection logs
+SUPPRESS_HTTPX_LOGS = True           # Suppress HTTP request logs
+
+# ═══════════════════════════════════════════════════════════════════════════
+# END OF CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Initialize Pyrogram bot client
 bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
 # 🧩 LOGGING SETUP  
 # ───────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Suppress Pyrogram connection logs and reduce logging overhead
-logging.getLogger('pyrogram').setLevel(logging.ERROR)  # Changed from WARNING to ERROR
-logging.getLogger('httpx').setLevel(logging.WARNING)  # Suppress HTTP logs
+# Suppress Pyrogram and HTTP logs based on configuration
+if SUPPRESS_PYROGRAM_LOGS:
+    logging.getLogger('pyrogram').setLevel(logging.ERROR)
+if SUPPRESS_HTTPX_LOGS:
+    logging.getLogger('httpx').setLevel(logging.WARNING)
 
 def log_memory():
     """Log detailed memory usage with garbage collection info"""
+    if not LOG_MEMORY_USAGE:
+        return
+        
     try:
         import psutil
         process = psutil.Process()
@@ -130,10 +211,11 @@ def log_memory():
         
         logger.info(f"💾 Memory: RSS={rss_mb:.2f}MB, VMS={vms_mb:.2f}MB | GC: {gc_counts} | Objects: {len(gc.get_objects())}")
         
-        # Log detailed GC stats for each generation
-        for i, stats in enumerate(gc_stats):
-            if stats['collections'] > 0:
-                logger.debug(f"GC Gen{i}: {stats['collections']} collections, {stats['collected']} collected, {stats['uncollectable']} uncollectable")
+        # Log detailed GC stats for each generation (only if enabled)
+        if LOG_DETAILED_GC_STATS:
+            for i, stats in enumerate(gc_stats):
+                if stats['collections'] > 0:
+                    logger.debug(f"GC Gen{i}: {stats['collections']} collections, {stats['collected']} collected, {stats['uncollectable']} uncollectable")
                 
     except ImportError:
         # Fallback to basic GC info without psutil
@@ -142,6 +224,9 @@ def log_memory():
 
 def force_garbage_collection():
     """Force aggressive garbage collection and log results"""
+    if not ENABLE_GARBAGE_COLLECTION:
+        return 0, 0
+        
     try:
         # Get initial object count
         initial_objects = len(gc.get_objects())
@@ -157,7 +242,8 @@ def force_garbage_collection():
         final_counts = gc.get_count()
         objects_freed = initial_objects - final_objects
         
-        logger.info(f"🧹 GC: Collected {collected} objects, freed {objects_freed} references | {initial_counts} → {final_counts}")
+        if LOG_MEMORY_USAGE:
+            logger.info(f"🧹 GC: Collected {collected} objects, freed {objects_freed} references | {initial_counts} → {final_counts}")
         
         return collected, objects_freed
         
@@ -165,7 +251,8 @@ def force_garbage_collection():
         logger.warning(f"⚠️ Garbage collection error: {str(e)}")
         # Fallback to basic collection
         collected = gc.collect()
-        logger.info(f"🧹 GC: Basic collection freed {collected} objects")
+        if LOG_MEMORY_USAGE:
+            logger.info(f"🧹 GC: Basic collection freed {collected} objects")
         return collected, 0
 
 def generate_bar(percentage):
@@ -294,15 +381,23 @@ def convert_video_to_thumbnail(filepath, video_url):
 
 def is_video_url(url):
     """Check if URL is a video that should be converted to thumbnail"""
-    # Check if URL starts with special video domain prefix
+    # First, check excluded video prefixes (URLs that look like videos but don't work)
+    for excluded_prefix in EXCLUDED_VIDEO_PREFIXES:
+        if url.startswith(excluded_prefix):
+            logger.debug(f"⚠️ Excluding video URL (matches excluded prefix): {url}")
+            return False
+    
+    # Check if URL starts with EXACT special video domain prefix
     if url.startswith(VIDEO_DOMAIN_PREFIX):
+        logger.debug(f"✅ Video URL detected (matches VIDEO_DOMAIN_PREFIX): {url}")
         return True
     
-    # Check if URL has video extension
-    url_lower = url.lower()
-    for ext in VIDEO_EXTS:
-        if f'.{ext}' in url_lower:
-            return True
+    # DO NOT check for video extensions by default - only exact domain match
+    # Uncomment below if you want to enable extension-based detection for other domains
+    # url_lower = url.lower()
+    # for ext in VIDEO_EXTS:
+    #     if f'.{ext}' in url_lower:
+    #         return True
     
     return False
 
@@ -391,24 +486,24 @@ def _try_conversion_strategy(img, filepath, target_width, target_height, origina
         elif working_img.mode != 'RGB':
             working_img = working_img.convert('RGB')
         
-        # Set quality based on strategy
+        # Set quality based on strategy using configuration
         if strategy == 1:
-            quality = 95 if original_size < MAX_IMAGE_SIZE else 85
+            quality = CONVERSION_QUALITY_HIGH if original_size < MAX_IMAGE_SIZE else CONVERSION_QUALITY_MEDIUM
             optimize = True
         elif strategy == 2:
-            quality = 75
+            quality = CONVERSION_QUALITY_MEDIUM
             optimize = True
             # Additional size reduction if still too large
             if original_size > MAX_IMAGE_SIZE // 2:
-                new_width = int(target_width * 0.8)
-                new_height = int(target_height * 0.8)
+                new_width = int(target_width * CONVERSION_RESIZE_FACTOR_S2)
+                new_height = int(target_height * CONVERSION_RESIZE_FACTOR_S2)
                 working_img = working_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
         else:  # strategy == 3
-            quality = 60
+            quality = CONVERSION_QUALITY_LOW
             optimize = True
-            # Aggressive size reduction
-            new_width = min(int(target_width * 0.6), 1920)
-            new_height = min(int(target_height * 0.6), 1080)
+            # Aggressive size reduction using configuration
+            new_width = min(int(target_width * CONVERSION_RESIZE_FACTOR_S3), CONVERSION_MAX_WIDTH_S3)
+            new_height = min(int(target_height * CONVERSION_RESIZE_FACTOR_S3), CONVERSION_MAX_HEIGHT_S3)
             working_img = working_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
         
         # Save with specified quality
@@ -665,7 +760,9 @@ async def fetch_html(url: str):
             return None  # Will be handled by extract_media_data_from_html_cached
             
         async with httpx.AsyncClient() as client:
-            r = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
+            # Use first timeout value for HTML fetch
+            html_timeout = TIMEOUT[0] if isinstance(TIMEOUT, list) else TIMEOUT
+            r = await client.get(url, follow_redirects=True, timeout=html_timeout)
             return r.text if r.status_code == 200 else ""
     except Exception as e:
         logger.error(f"Fetch error for {url}: {e}")
@@ -745,8 +842,21 @@ def filter_and_deduplicate_urls(username_images):
         for url in urls:
             if not url or not url.startswith(('http://', 'https://')):
                 continue
+            
             # Exclude domains
             if any(domain in url.lower() for domain in EXCLUDED_DOMAINS):
+                logger.debug(f"⚠️ Excluding URL (domain excluded): {url}")
+                continue
+            
+            # Exclude bad video URLs (that look like videos but don't download)
+            is_excluded_video = False
+            for excluded_prefix in EXCLUDED_VIDEO_PREFIXES:
+                if url.startswith(excluded_prefix):
+                    logger.debug(f"⚠️ Excluding URL (bad video prefix): {url}")
+                    is_excluded_video = True
+                    break
+            
+            if is_excluded_video:
                 continue
             
             url_lower = url.lower()
@@ -769,9 +879,13 @@ def filter_and_deduplicate_urls(username_images):
 
     return filtered_username_images, all_urls
 
-async def download_batch(urls, temp_dir, base_timeout=TIMEOUT):
+async def download_batch(urls, temp_dir, base_timeout=None):
     """Download batch of URLs concurrently with connection pooling"""
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_WORKERS)
+    
+    # Use maximum timeout for client initialization
+    if base_timeout is None:
+        base_timeout = TIMEOUT[-1] if isinstance(TIMEOUT, list) else TIMEOUT
     
     # Use a single client for all downloads in this batch for better performance
     async with httpx.AsyncClient(
@@ -797,9 +911,9 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
             try:
                 logger.info(f"📥 Attempt {attempt}/{max_retries} downloading: {url}")
                 
-                # Use different timeout strategies for different attempts
-                timeout_multiplier = 1 + (attempt - 1) * 0.5  # Increase timeout on retries
-                current_timeout = TIMEOUT * timeout_multiplier
+                # Use dynamic timeout growth for each attempt
+                attempt_index = min(attempt - 1, len(TIMEOUT) - 1)
+                current_timeout = TIMEOUT[attempt_index]
                 
                 # Create headers to mimic browser requests
                 headers = {
@@ -967,8 +1081,11 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {str(e)}")
             
             if attempt < max_retries:
-                logger.info(f"🔄 Retrying in {RETRY_DELAY}s: {url}")
-                await asyncio.sleep(RETRY_DELAY)
+                # Use dynamic retry delay growth for each attempt
+                retry_index = min(attempt - 1, len(RETRY_DELAY) - 1)
+                current_retry_delay = RETRY_DELAY[retry_index]
+                logger.info(f"🔄 Retrying in {current_retry_delay}s: {url}")
+                await asyncio.sleep(current_retry_delay)
         
         return None
 
@@ -1290,7 +1407,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 
                 # Update progress - ACCURATE calculation
                 now = time.time()
-                if progress_msg and (now - last_edit[0] > 5):
+                if progress_msg and (now - last_edit[0] > PROGRESS_UPDATE_DELAY):
                     # Calculate accurate progress
                     urls_downloaded = len(successfully_downloaded_urls)
                     urls_permanently_failed = total_failed_permanently
