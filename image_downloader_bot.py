@@ -23,6 +23,7 @@ from fastapi import FastAPI
 import uvicorn
 import threading
 from PIL import Image
+import imageio.v3 as iio
 
 # Health check app
 app = FastAPI()
@@ -69,8 +70,10 @@ PROGRESS_PERCENT_THRESHOLD = 10   # Minimum % change to trigger update
 
 # Content Filtering Configuration
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
-VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]  # Removed GIF
-EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv", "gif"]  # Added GIF to excluded
+VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif", "gif"]  # Added GIF back
+EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]  # Removed GIF - will convert to image
+VIDEO_DOMAIN_PREFIX = "https://video.desifakes.net/vh/dli?"  # Special domain for video thumbnail extraction
+VIDEO_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]  # Video extensions for thumbnail extraction
 MIN_IMAGE_SIZE = 100            # Minimum image size in bytes (reduced to accept tiny images)
 MAX_IMAGE_SIZE = 20 * 1024 * 1024  # Maximum image size (20MB - Telegram's actual limit)
 
@@ -242,14 +245,75 @@ def validate_image_for_telegram(filepath):
         # Don't reject on validation errors - but flag for conversion
         return False, "validation_error_needs_conversion"
 
+def convert_gif_to_thumbnail(filepath):
+    """Convert GIF to static thumbnail (first frame) as PNG"""
+    try:
+        logger.info(f"🎬 Converting GIF to thumbnail: {filepath}")
+        with Image.open(filepath) as gif:
+            # Get first frame
+            gif.seek(0)
+            frame = gif.convert("RGB")
+            
+            # Create new filepath with .png extension
+            thumbnail_path = filepath.rsplit('.', 1)[0] + '_thumbnail.png'
+            frame.save(thumbnail_path, 'PNG', optimize=True)
+            
+            # Replace original file with thumbnail
+            os.remove(filepath)
+            os.rename(thumbnail_path, filepath)
+            
+            new_size = os.path.getsize(filepath)
+            logger.info(f"✅ GIF converted to thumbnail: {new_size} bytes")
+            return True
+    except Exception as e:
+        logger.error(f"❌ GIF conversion failed for {filepath}: {str(e)}")
+        return False
+
+def convert_video_to_thumbnail(filepath, video_url):
+    """Convert video to thumbnail (first frame) as JPG using imageio"""
+    try:
+        logger.info(f"🎥 Converting video to thumbnail: {filepath}")
+        
+        # Read first frame from video file
+        frame = iio.imread(filepath, index=0)
+        
+        # Create new filepath with .jpg extension
+        thumbnail_path = filepath.rsplit('.', 1)[0] + '_thumbnail.jpg'
+        iio.imwrite(thumbnail_path, frame)
+        
+        # Replace original file with thumbnail
+        os.remove(filepath)
+        os.rename(thumbnail_path, filepath)
+        
+        new_size = os.path.getsize(filepath)
+        logger.info(f"✅ Video converted to thumbnail: {new_size} bytes")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Video conversion failed for {filepath}: {str(e)}")
+        return False
+
+def is_video_url(url):
+    """Check if URL is a video that should be converted to thumbnail"""
+    # Check if URL starts with special video domain prefix
+    if url.startswith(VIDEO_DOMAIN_PREFIX):
+        return True
+    
+    # Check if URL has video extension
+    url_lower = url.lower()
+    for ext in VIDEO_EXTS:
+        if f'.{ext}' in url_lower:
+            return True
+    
+    return False
+
 def convert_image_for_telegram(filepath):
     """Convert/optimize image for better Telegram compatibility with multiple strategies"""
     try:
         with Image.open(filepath) as img:
-            # Reject GIF format - don't try to convert
+            # Handle GIF format - convert to thumbnail
             if img.format == 'GIF':
-                logger.warning(f"⚠️ GIF files cannot be sent as photos: {filepath}")
-                return False
+                logger.info(f"🎬 GIF detected, converting to thumbnail: {filepath}")
+                return convert_gif_to_thumbnail(filepath)
             
             # Get original info
             width, height = img.size
@@ -671,7 +735,7 @@ def create_username_images(media_data, usernames):
     return username_images
 
 def filter_and_deduplicate_urls(username_images):
-    """Filter URLs, exclude domains, remove duplicates, keep only images"""
+    """Filter URLs, exclude domains, remove duplicates, include images/GIFs/videos for conversion"""
     all_urls = []
     seen_urls = set()
     filtered_username_images = {}
@@ -684,15 +748,22 @@ def filter_and_deduplicate_urls(username_images):
             # Exclude domains
             if any(domain in url.lower() for domain in EXCLUDED_DOMAINS):
                 continue
-            # Check if image extension
+            
             url_lower = url.lower()
+            
+            # Check if it's a video URL that should be converted to thumbnail
+            is_convertible_video = is_video_url(url)
+            
+            # Check if image extension (including GIF now)
             has_image_ext = any(f".{ext}" in url_lower for ext in VALID_IMAGE_EXTS)
-            is_excluded = any(f".{ext}" in url_lower for ext in EXCLUDED_MEDIA_EXTS)
-            if not is_excluded and has_image_ext:
+            
+            # Accept if: valid image OR convertible video
+            if has_image_ext or is_convertible_video:
                 if url not in seen_urls:
                     seen_urls.add(url)
                     all_urls.append(url)
                     filtered_urls.append(url)
+        
         if filtered_urls:
             filtered_username_images[username] = filtered_urls
 
@@ -750,15 +821,28 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                     content_size = len(content)
                     
                     if content_size > MIN_IMAGE_SIZE:
-                        # Detect GIF files by content (magic bytes) - exclude animated GIFs
-                        if content[:3] == b'GIF':
-                            logger.warning(f"⚠️ Skipping GIF file (not supported for photos): {url}")
-                            await update_url_download_status(url, 'failed', error_reason="gif_file_not_supported")
-                            return None
+                        # Check if this is a video URL that needs thumbnail extraction
+                        is_video = is_video_url(url)
+                        
+                        # Detect file type by content (magic bytes)
+                        is_gif = content[:3] == b'GIF'
+                        
+                        # Determine file extension
+                        if is_video:
+                            # For videos, use appropriate extension
+                            extension = '.mp4'  # Default to mp4
+                            for ext in VIDEO_EXTS:
+                                if f'.{ext}' in url.lower():
+                                    extension = f'.{ext}'
+                                    break
+                        elif is_gif:
+                            extension = '.gif'
+                        else:
+                            extension = '.jpg'
                         
                         # Use a more unique filename to avoid conflicts
                         timestamp = int(time.time() * 1000000)
-                        filename = f"img_{timestamp}_{content_size}_{hash(url) % 10000}.jpg"
+                        filename = f"img_{timestamp}_{content_size}_{hash(url) % 10000}{extension}"
                         filepath = os.path.join(temp_dir, filename)
                         
                         # Write file efficiently
@@ -769,6 +853,32 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         
                         # Clear content from memory immediately
                         del content
+                        
+                        # Convert video to thumbnail if needed
+                        if is_video:
+                            logger.info(f"🎥 Video detected, converting to thumbnail: {url}")
+                            converted = convert_video_to_thumbnail(filepath, url)
+                            if not converted:
+                                logger.error(f"❌ Video thumbnail conversion failed: {url}")
+                                await update_url_download_status(url, 'failed', error_reason="video_conversion_failed")
+                                try:
+                                    os.remove(filepath)
+                                except:
+                                    pass
+                                return None
+                        
+                        # Convert GIF to thumbnail if needed
+                        elif is_gif:
+                            logger.info(f"🎬 GIF detected, converting to thumbnail: {url}")
+                            converted = convert_gif_to_thumbnail(filepath)
+                            if not converted:
+                                logger.error(f"❌ GIF thumbnail conversion failed: {url}")
+                                await update_url_download_status(url, 'failed', error_reason="gif_conversion_failed")
+                                try:
+                                    os.remove(filepath)
+                                except:
+                                    pass
+                                return None
                         
                         # Validate and convert image for Telegram compatibility
                         is_valid, reason = validate_image_for_telegram(filepath)
