@@ -1091,7 +1091,10 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
 
 async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, batch_num=1):
     """Send batch of images using Pyrogram - memory efficient version with better error handling"""
+    logger.info(f"🔍 send_image_batch_pyrogram called: {len(images) if images else 0} images, username={username}, chat_id={chat_id}, topic_id={topic_id}")
+    
     if not images:
+        logger.warning("⚠️ No images provided to send_image_batch_pyrogram")
         return False
 
     # Filter out invalid images before sending - but try to convert first
@@ -1127,14 +1130,18 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                         pass
 
     if not valid_images:
-        logger.warning(f"No valid images found for {username} batch {batch_num}")
+        logger.warning(f"⚠️ No valid images found for {username} batch {batch_num} after validation")
         return False
+
+    logger.info(f"✅ {len(valid_images)}/{len(images)} images passed validation for {username}")
 
     # Split into chunks using configurable size
     chunks = [valid_images[i:i + MEDIA_GROUP_SIZE] for i in range(0, len(valid_images), MEDIA_GROUP_SIZE)]
     
     successful_chunks = 0
     total_chunks = len(chunks)
+    
+    logger.info(f"📦 Splitting {len(valid_images)} images into {total_chunks} chunks for {username}")
 
     for idx, chunk in enumerate(chunks):
         async with SEND_SEMAPHORE:
@@ -1170,8 +1177,10 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                         continue
 
                 if not media:
-                    logger.warning(f"No valid media created for {username} chunk {idx}")
+                    logger.warning(f"⚠️ No valid media created for {username} chunk {idx} - skipping")
                     continue
+
+                logger.info(f"📤 Prepared {len(media)} media items for {username} chunk {idx+1}/{total_chunks}")
 
                 # Send with improved retry mechanism
                 max_send_retries = 3
@@ -1179,12 +1188,13 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                 
                 for attempt in range(max_send_retries):
                     try:
+                        logger.info(f"🚀 Attempt {attempt+1}/{max_send_retries}: Sending {len(media)} media to chat_id={chat_id}, topic_id={topic_id}")
                         if topic_id:
                             await bot.send_media_group(chat_id, media, reply_to_message_id=topic_id)
                         else:
                             await bot.send_media_group(chat_id, media)
                         successful_chunks += 1
-                        logger.debug(f"✅ Sent chunk {idx+1}/{total_chunks} for {username}")
+                        logger.info(f"✅ Successfully sent chunk {idx+1}/{total_chunks} for {username} (attempt {attempt+1})")
                         break
                         
                     except FloodWait as e:
@@ -1446,7 +1456,8 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     send_batch = success_images[:10]
                     success_images = success_images[10:]
                     
-                    logger.info(f"\n📤 Sending group of 10 images for {username}")
+                    logger.info(f"\n📤 ATTEMPTING TO SEND group of 10 images for {username}")
+                    logger.info(f"📊 Send batch details: {len(send_batch)} images, chat_id={chat_id}, topic={user_topic}")
                     
                     try:
                         success = await send_image_batch_pyrogram(send_batch, username, chat_id, user_topic, batch_num)
@@ -1454,9 +1465,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                             total_sent += 10
                             logger.info(f"✅ Successfully sent 10 images | Total sent: {total_sent}")
                         else:
-                            logger.warning(f"⚠️ Failed to send batch")
+                            logger.warning(f"⚠️ Failed to send batch - send function returned False")
                     except Exception as e:
                         logger.error(f"❌ Error sending batch: {str(e)}")
+                        import traceback
+                        logger.error(f"📜 Full traceback: {traceback.format_exc()}")
                     
                     # Clean up sent images and force GC
                     cleanup_images(send_batch)
