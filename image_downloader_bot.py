@@ -69,8 +69,8 @@ PROGRESS_PERCENT_THRESHOLD = 10   # Minimum % change to trigger update
 
 # Content Filtering Configuration
 EXCLUDED_DOMAINS = ["pornbb.xyz"]
-VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]
-EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv"]
+VALID_IMAGE_EXTS = ["jpg", "jpeg", "png", "webp", "bmp", "tiff", "svg", "ico", "avif", "jfif"]  # Removed GIF
+EXCLUDED_MEDIA_EXTS = ["mp4", "avi", "mov", "webm", "mkv", "flv", "wmv", "gif"]  # Added GIF to excluded
 MIN_IMAGE_SIZE = 100            # Minimum image size in bytes (reduced to accept tiny images)
 MAX_IMAGE_SIZE = 20 * 1024 * 1024  # Maximum image size (20MB - Telegram's actual limit)
 
@@ -101,7 +101,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7841933095:AAEz5SLNiGzWanheul1bwZL4HJbQBOBRO
 bot = Client("image_downloader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ───────────────────────────────
-# 🧩 LOGGING SETUP
+# 🧩 LOGGING SETUP  
 # ───────────────────────────────
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -207,6 +207,11 @@ def validate_image_for_telegram(filepath):
             
             # Enhanced format checking with better compatibility detection
             if img.format:
+                # Reject GIF format entirely - not supported as photos
+                if img.format == 'GIF':
+                    logger.debug(f"GIF format not supported for photos: {filepath}")
+                    return False, "gif_not_supported"
+                
                 # Check for problematic formats that often cause PHOTO_SAVE_FILE_INVALID
                 problematic_formats = ['WEBP', 'TIFF', 'BMP', 'ICO']
                 if img.format in problematic_formats:
@@ -241,6 +246,11 @@ def convert_image_for_telegram(filepath):
     """Convert/optimize image for better Telegram compatibility with multiple strategies"""
     try:
         with Image.open(filepath) as img:
+            # Reject GIF format - don't try to convert
+            if img.format == 'GIF':
+                logger.warning(f"⚠️ GIF files cannot be sent as photos: {filepath}")
+                return False
+            
             # Get original info
             width, height = img.size
             file_size = os.path.getsize(filepath)
@@ -740,6 +750,12 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                     content_size = len(content)
                     
                     if content_size > MIN_IMAGE_SIZE:
+                        # Detect GIF files by content (magic bytes) - exclude animated GIFs
+                        if content[:3] == b'GIF':
+                            logger.warning(f"⚠️ Skipping GIF file (not supported for photos): {url}")
+                            await update_url_download_status(url, 'failed', error_reason="gif_file_not_supported")
+                            return None
+                        
                         # Use a more unique filename to avoid conflicts
                         timestamp = int(time.time() * 1000000)
                         filename = f"img_{timestamp}_{content_size}_{hash(url) % 10000}.jpg"
@@ -1148,7 +1164,16 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 # Update progress
                 now = time.time()
                 if progress_msg and (now - last_edit[0] > 5):
+                    # Calculate progress percentage
+                    total_urls_user = len(urls)
+                    processed_urls = len(urls) - len(pending_urls) - len(failed_urls)
+                    progress_percent = int((processed_urls / total_urls_user) * 100) if total_urls_user > 0 else 0
+                    
+                    # Generate progress bar
+                    bar = generate_bar(progress_percent)
+                    
                     progress = f"""👤 User: {username} ({user_idx}/{len(username_images)})
+{bar} {progress_percent}%
 📦 Batch: {batch_num} | Round: {round_num}
 📥 Downloaded: {total_downloaded}
 📤 Sent: {total_sent}
@@ -1157,9 +1182,15 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
 🔄 Retry Queue: {len(failed_urls)}"""
                     try:
                         await progress_msg.edit(progress)
-                    except:
+                        last_edit[0] = now
+                    except FloodWait as e:
+                        # Handle Telegram flood wait
+                        logger.warning(f"⚠️ Progress update FloodWait: {e.value}s")
+                        last_edit[0] = now + e.value  # Skip updates for flood wait duration
+                    except Exception as e:
+                        # Ignore other errors (like message not modified)
+                        logger.debug(f"Progress update skipped: {str(e)}")
                         pass
-                    last_edit[0] = now
                 
                 # Send images if we have 10 or more
                 while len(success_images) >= 10:
