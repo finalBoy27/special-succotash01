@@ -1062,8 +1062,9 @@ def cleanup_images(images):
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
     """
-    NEW LOGIC: Process URLs in batches of 10 with retry mechanism
+    FIXED LOGIC: Process URLs in batches of 10 with retry mechanism
     - Process 10 URLs at a time with retries
+    - Track successfully downloaded URLs to prevent duplicates
     - Failed URLs go to retry queue (max 2 attempts per URL total)
     - Send images in groups of 10 when accumulated >= 10
     - Clear memory after each send
@@ -1088,7 +1089,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     
     # Log initial memory state
     log_memory()
-    logger.info(f"🚀 Starting NEW batch processing logic for {len(username_images)} users")
+    logger.info(f"🚀 Starting FIXED batch processing logic for {len(username_images)} users")
     
     # Process each username one by one
     for user_idx, (username, urls) in enumerate(username_images.items(), 1):
@@ -1101,12 +1102,16 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         pending_urls = list(urls)  # Main queue
         failed_urls = []  # Failed URLs queue (for retry)
         retry_count = {}  # Track retry attempts per URL
+        successfully_downloaded_urls = set()  # Track URLs that were successfully downloaded
         
         # Success image accumulator for this user
         success_images = []
         
         # Get topic for this user
         user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+        
+        # Total URLs for progress calculation
+        total_urls_user = len(urls)
         
         # Phase 1: Process all pending URLs in batches of 10
         round_num = 1
@@ -1116,6 +1121,7 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             if pending_urls:
                 current_queue = pending_urls
                 queue_name = "PENDING"
+                pending_urls = []  # Clear pending, will process all in this round
             elif failed_urls:
                 current_queue = failed_urls
                 queue_name = "RETRY"
@@ -1143,12 +1149,23 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 logger.info(f"✅ Success: {success_count}/{len(batch_urls)}")
                 logger.info(f"❌ Failed: {failed_count}/{len(batch_urls)}")
                 
+                # Track successfully downloaded URLs to prevent duplicates
+                for img_data in successful_downloads:
+                    # Extract URL from image data
+                    if isinstance(img_data, dict) and 'url' in img_data:
+                        successfully_downloaded_urls.add(img_data['url'])
+                
                 # Add successful downloads to accumulator
                 success_images.extend(successful_downloads)
                 total_downloaded += success_count
                 
-                # Handle failed URLs - check retry count
+                # Handle failed URLs - check retry count and ensure not already downloaded
                 for failed_url in failed_downloads:
+                    # Skip if this URL was already successfully downloaded
+                    if failed_url in successfully_downloaded_urls:
+                        logger.debug(f"⏭️ Skipping retry for already downloaded URL: {failed_url}")
+                        continue
+                    
                     if failed_url not in retry_count:
                         retry_count[failed_url] = 0
                     
@@ -1161,13 +1178,17 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                         logger.warning(f"❌ URL permanently failed after 2 attempts: {failed_url}")
                         total_failed_permanently += 1
                 
-                # Update progress
+                # Update progress - ACCURATE calculation
                 now = time.time()
                 if progress_msg and (now - last_edit[0] > 5):
-                    # Calculate progress percentage
-                    total_urls_user = len(urls)
-                    processed_urls = len(urls) - len(pending_urls) - len(failed_urls)
-                    progress_percent = int((processed_urls / total_urls_user) * 100) if total_urls_user > 0 else 0
+                    # Calculate accurate progress
+                    urls_downloaded = len(successfully_downloaded_urls)
+                    urls_permanently_failed = total_failed_permanently
+                    urls_in_retry = len(failed_urls)
+                    urls_remaining = total_urls_user - urls_downloaded - urls_permanently_failed - urls_in_retry
+                    
+                    # Progress = (downloaded + permanently failed) / total
+                    progress_percent = min(100, int(((urls_downloaded + urls_permanently_failed) / total_urls_user) * 100)) if total_urls_user > 0 else 0
                     
                     # Generate progress bar
                     bar = generate_bar(progress_percent)
@@ -1175,11 +1196,11 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     progress = f"""👤 User: {username} ({user_idx}/{len(username_images)})
 {bar} {progress_percent}%
 📦 Batch: {batch_num} | Round: {round_num}
-📥 Downloaded: {total_downloaded}
+📥 Downloaded: {urls_downloaded}
 📤 Sent: {total_sent}
 💾 Pending Send: {len(success_images)}
 ❌ Failed: {total_failed_permanently}
-🔄 Retry Queue: {len(failed_urls)}"""
+🔄 Retry Queue: {urls_in_retry}"""
                     try:
                         await progress_msg.edit(progress)
                         last_edit[0] = now
@@ -1189,7 +1210,8 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                         last_edit[0] = now + e.value  # Skip updates for flood wait duration
                     except Exception as e:
                         # Ignore other errors (like message not modified)
-                        logger.debug(f"Progress update skipped: {str(e)}")
+                        if "message is not modified" not in str(e).lower():
+                            logger.debug(f"Progress update skipped: {str(e)}")
                         pass
                 
                 # Send images if we have 10 or more
@@ -1246,6 +1268,9 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
             log_memory()
         
         logger.info(f"\n✅ Completed user: {username}")
+        logger.info(f"   • Successfully downloaded: {len(successfully_downloaded_urls)}/{total_urls_user}")
+        logger.info(f"   • Successfully sent: {total_sent}")
+        logger.info(f"   • Permanently failed: {total_failed_permanently}")
         logger.info(f"{'='*60}\n")
     
     # Final cleanup
