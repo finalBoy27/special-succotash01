@@ -333,7 +333,7 @@ def validate_image_for_telegram(filepath):
         return False, "validation_error_needs_conversion"
 
 def convert_gif_to_thumbnail(filepath):
-    """Convert GIF to static thumbnail (first frame) as PNG"""
+    """Convert GIF to static thumbnail (first frame) as JPEG"""
     try:
         logger.info(f"🎬 Converting GIF to thumbnail: {filepath}")
         with Image.open(filepath) as gif:
@@ -341,20 +341,20 @@ def convert_gif_to_thumbnail(filepath):
             gif.seek(0)
             frame = gif.convert("RGB")
             
-            # Create new filepath with .png extension
-            thumbnail_path = filepath.rsplit('.', 1)[0] + '_thumbnail.png'
-            frame.save(thumbnail_path, 'PNG', optimize=True)
+            # Create new filepath with .jpg extension (Telegram requires correct extension)
+            new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
+            frame.save(new_filepath, 'JPEG', quality=95, optimize=True)
             
-            # Replace original file with thumbnail
-            os.remove(filepath)
-            os.rename(thumbnail_path, filepath)
+            # Remove original GIF file
+            if os.path.exists(filepath):
+                os.remove(filepath)
             
-            new_size = os.path.getsize(filepath)
-            logger.info(f"✅ GIF converted to thumbnail: {new_size} bytes")
-            return True
+            new_size = os.path.getsize(new_filepath)
+            logger.info(f"✅ GIF converted to thumbnail: {new_size} bytes → {new_filepath}")
+            return new_filepath  # Return new path with correct extension
     except Exception as e:
         logger.error(f"❌ GIF conversion failed for {filepath}: {str(e)}")
-        return False
+        return None
 
 def convert_video_to_thumbnail(filepath, video_url):
     """Convert video to thumbnail (first frame) as JPG using imageio"""
@@ -364,20 +364,20 @@ def convert_video_to_thumbnail(filepath, video_url):
         # Read first frame from video file
         frame = iio.imread(filepath, index=0)
         
-        # Create new filepath with .jpg extension
-        thumbnail_path = filepath.rsplit('.', 1)[0] + '_thumbnail.jpg'
-        iio.imwrite(thumbnail_path, frame)
+        # Create new filepath with .jpg extension (Telegram requires correct extension)
+        new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
+        iio.imwrite(new_filepath, frame, quality=VIDEO_THUMBNAIL_QUALITY)
         
-        # Replace original file with thumbnail
-        os.remove(filepath)
-        os.rename(thumbnail_path, filepath)
+        # Remove original video file
+        if os.path.exists(filepath):
+            os.remove(filepath)
         
-        new_size = os.path.getsize(filepath)
-        logger.info(f"✅ Video converted to thumbnail: {new_size} bytes")
-        return True
+        new_size = os.path.getsize(new_filepath)
+        logger.info(f"✅ Video converted to thumbnail: {new_size} bytes → {new_filepath}")
+        return new_filepath  # Return new path with correct extension
     except Exception as e:
         logger.error(f"❌ Video conversion failed for {filepath}: {str(e)}")
-        return False
+        return None
 
 def is_video_url(url):
     """Check if URL is a video that should be converted to thumbnail"""
@@ -402,13 +402,15 @@ def is_video_url(url):
     return False
 
 def convert_image_for_telegram(filepath):
-    """Convert/optimize image for better Telegram compatibility with multiple strategies"""
+    """Convert/optimize image for better Telegram compatibility with multiple strategies
+    Returns: new filepath if conversion successful, None otherwise"""
     try:
         with Image.open(filepath) as img:
             # Handle GIF format - convert to thumbnail
             if img.format == 'GIF':
                 logger.info(f"🎬 GIF detected, converting to thumbnail: {filepath}")
-                return convert_gif_to_thumbnail(filepath)
+                new_path = convert_gif_to_thumbnail(filepath)
+                return new_path  # Returns new .jpg path or None
             
             # Get original info
             width, height = img.size
@@ -438,31 +440,39 @@ def convert_image_for_telegram(filepath):
             
             # Convert with multiple strategies
             if needs_conversion:
+                # Determine output filepath with .jpg extension
+                if not filepath.lower().endswith('.jpg') and not filepath.lower().endswith('.jpeg'):
+                    new_filepath = filepath.rsplit('.', 1)[0] + '.jpg'
+                else:
+                    new_filepath = filepath
+                
                 # Strategy 1: Try to preserve as much quality as possible
-                success = _try_conversion_strategy(img, filepath, target_width, target_height, file_size, strategy=1)
+                success = _try_conversion_strategy(img, filepath, new_filepath, target_width, target_height, file_size, strategy=1)
                 if success:
-                    return True
+                    return new_filepath
                 
                 # Strategy 2: More aggressive compression
                 logger.warning("🔄 First conversion failed, trying more aggressive compression")
-                success = _try_conversion_strategy(img, filepath, target_width, target_height, file_size, strategy=2)
+                success = _try_conversion_strategy(img, filepath, new_filepath, target_width, target_height, file_size, strategy=2)
                 if success:
-                    return True
+                    return new_filepath
                 
                 # Strategy 3: Very aggressive - minimal quality but guaranteed compatibility
                 logger.warning("🔄 Second conversion failed, trying maximum compression")
-                success = _try_conversion_strategy(img, filepath, target_width, target_height, file_size, strategy=3)
+                success = _try_conversion_strategy(img, filepath, new_filepath, target_width, target_height, file_size, strategy=3)
                 if success:
-                    return True
+                    return new_filepath
             
-            return False  # No conversion needed or all strategies failed
+            return None  # No conversion needed or all strategies failed
             
     except Exception as e:
         logger.error(f"❌ Image conversion failed for {filepath}: {str(e)}")
         return False
 
-def _try_conversion_strategy(img, filepath, target_width, target_height, original_size, strategy=1):
-    """Try different conversion strategies with increasing aggressiveness"""
+def _try_conversion_strategy(img, old_filepath, new_filepath, target_width, target_height, original_size, strategy=1):
+    """Try different conversion strategies with increasing aggressiveness
+    old_filepath: original file path
+    new_filepath: output file path (with .jpg extension)"""
     try:
         # Create a copy to work with
         working_img = img.copy()
@@ -506,11 +516,18 @@ def _try_conversion_strategy(img, filepath, target_width, target_height, origina
             new_height = min(int(target_height * CONVERSION_RESIZE_FACTOR_S3), CONVERSION_MAX_HEIGHT_S3)
             working_img = working_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
         
-        # Save with specified quality
-        working_img.save(filepath, 'JPEG', quality=quality, optimize=optimize, progressive=True)
+        # Save with specified quality to new filepath
+        working_img.save(new_filepath, 'JPEG', quality=quality, optimize=optimize, progressive=True)
         
-        new_size = os.path.getsize(filepath)
-        logger.info(f"✅ Strategy {strategy} successful: {original_size} → {new_size} bytes (Q{quality})")
+        # Remove old file if different from new file
+        if old_filepath != new_filepath and os.path.exists(old_filepath):
+            try:
+                os.remove(old_filepath)
+            except:
+                pass
+        
+        new_size = os.path.getsize(new_filepath)
+        logger.info(f"✅ Strategy {strategy} successful: {original_size} → {new_size} bytes (Q{quality}) → {new_filepath}")
         
         # Validate the result
         if new_size > MAX_IMAGE_SIZE:
@@ -971,8 +988,8 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         # Convert video to thumbnail if needed
                         if is_video:
                             logger.info(f"🎥 Video detected, converting to thumbnail: {url}")
-                            converted = convert_video_to_thumbnail(filepath, url)
-                            if not converted:
+                            new_filepath = convert_video_to_thumbnail(filepath, url)
+                            if not new_filepath:
                                 logger.error(f"❌ Video thumbnail conversion failed: {url}")
                                 await update_url_download_status(url, 'failed', error_reason="video_conversion_failed")
                                 try:
@@ -980,12 +997,13 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                                 except:
                                     pass
                                 return None
+                            filepath = new_filepath  # Update to new .jpg path
                         
                         # Convert GIF to thumbnail if needed
                         elif is_gif:
                             logger.info(f"🎬 GIF detected, converting to thumbnail: {url}")
-                            converted = convert_gif_to_thumbnail(filepath)
-                            if not converted:
+                            new_filepath = convert_gif_to_thumbnail(filepath)
+                            if not new_filepath:
                                 logger.error(f"❌ GIF thumbnail conversion failed: {url}")
                                 await update_url_download_status(url, 'failed', error_reason="gif_conversion_failed")
                                 try:
@@ -993,14 +1011,16 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                                 except:
                                     pass
                                 return None
+                            filepath = new_filepath  # Update to new .jpg path
                         
                         # Validate and convert image for Telegram compatibility
                         is_valid, reason = validate_image_for_telegram(filepath)
                         if not is_valid:
                             # Try to convert/fix the image
                             logger.warning(f"🔄 Converting invalid image ({reason}): {url}")
-                            converted = convert_image_for_telegram(filepath)
-                            if converted:
+                            new_filepath = convert_image_for_telegram(filepath)
+                            if new_filepath:
+                                filepath = new_filepath  # Update to new path with correct extension
                                 # Re-validate after conversion
                                 is_valid, new_reason = validate_image_for_telegram(filepath)
                                 if is_valid:
@@ -1058,27 +1078,32 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                         
             except asyncio.TimeoutError:
                 if attempt == max_retries:
-                    logger.error(f"❌ Timeout after {max_retries} attempts: {url}")
+                    logger.error(f"❌ Timeout after {max_retries} attempts ({current_timeout}s timeout): {url}")
                     await update_url_download_status(url, 'failed', error_reason="timeout")
                     return None
                 else:
-                    logger.warning(f"⚠️ Timeout on attempt {attempt}, retrying with longer timeout: {url}")
+                    logger.warning(f"⚠️ Timeout on attempt {attempt} ({current_timeout}s), retrying with longer timeout: {url}")
             except Exception as e:
                 error_msg = str(e).lower()
-                if "connection" in error_msg or "network" in error_msg:
+                error_type = type(e).__name__
+                
+                # Log full error details
+                logger.warning(f"⚠️ Exception on attempt {attempt}: {error_type} - {str(e)[:300]}")
+                
+                if "connection" in error_msg or "network" in error_msg or "read" in error_msg or "timeout" in error_msg:
                     if attempt == max_retries:
-                        logger.error(f"❌ Network error after {max_retries} attempts: {url} - {str(e)}")
-                        await update_url_download_status(url, 'failed', error_reason=f"network_error")
+                        logger.error(f"❌ Network error after {max_retries} attempts: {url} - {error_type}: {str(e)[:200]}")
+                        await update_url_download_status(url, 'failed', error_reason=f"network_error_{error_type}")
                         return None
                     else:
-                        logger.warning(f"⚠️ Network error on attempt {attempt}, retrying: {url}")
+                        logger.warning(f"⚠️ Network error on attempt {attempt}, retrying: {url} - {error_type}")
                 else:
                     if attempt == max_retries:
-                        logger.error(f"❌ Download failed after {max_retries} attempts: {url} - {str(e)}")
-                        await update_url_download_status(url, 'failed', error_reason=str(e)[:200])
+                        logger.error(f"❌ Download failed after {max_retries} attempts: {url} - {error_type}: {str(e)[:200]}")
+                        await update_url_download_status(url, 'failed', error_reason=f"{error_type}_{str(e)[:100]}")
                         return None
                     else:
-                        logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {str(e)}")
+                        logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {error_type}: {str(e)[:100]}")
             
             if attempt < max_retries:
                 # Use dynamic retry delay growth for each attempt
@@ -1107,8 +1132,9 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
             else:
                 # Try to convert the image
                 logger.info(f"Attempting to convert image before sending ({reason}): {img['path']}")
-                converted = convert_image_for_telegram(img['path'])
-                if converted:
+                new_path = convert_image_for_telegram(img['path'])
+                if new_path:
+                    img['path'] = new_path  # Update to new path with correct extension
                     # Re-validate after conversion
                     is_valid_after, new_reason = validate_image_for_telegram(img['path'])
                     if is_valid_after:
@@ -1163,10 +1189,11 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                         is_valid, reason = validate_image_for_telegram(img['path'])
                         if not is_valid:
                             logger.warning(f"🔄 Final conversion attempt ({reason}): {img['path']}")
-                            converted = convert_image_for_telegram(img['path'])
-                            if not converted:
+                            new_path = convert_image_for_telegram(img['path'])
+                            if not new_path:
                                 logger.warning(f"❌ Final validation failed ({reason}): {img['path']}")
                                 continue
+                            img['path'] = new_path  # Update to new path with correct extension
                             
                         if i == 0:
                             media.append(InputMediaPhoto(img['path'], caption=f"{username.replace('_', ' ')} - B{current_batch_num}"))
