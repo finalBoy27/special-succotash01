@@ -1419,9 +1419,37 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     if isinstance(img_data, dict) and 'url' in img_data:
                         successfully_downloaded_urls.add(img_data['url'])
                 
-                # Add successful downloads to accumulator
-                success_images.extend(successful_downloads)
-                total_downloaded += success_count
+                # Add successful downloads to accumulator ONE BY ONE and check for send
+                for img in successful_downloads:
+                    success_images.append(img)
+                    total_downloaded += 1
+                    
+                    # IMMEDIATE SEND: If we have exactly 10 images, send them NOW
+                    if len(success_images) >= 10:
+                        send_batch = success_images[:10]
+                        success_images = success_images[10:]
+                        
+                        logger.info(f"\n📤 IMMEDIATE SEND: {len(send_batch)} images for {username} (Pending: {len(success_images)})")
+                        logger.info(f"📊 Send details: chat_id={chat_id}, topic={user_topic}")
+                        
+                        try:
+                            success = await send_image_batch_pyrogram(send_batch, username, chat_id, user_topic, batch_num)
+                            if success:
+                                total_sent += 10
+                                logger.info(f"✅ Sent 10 images | Total sent: {total_sent}")
+                            else:
+                                logger.warning(f"⚠️ Send failed - returned False")
+                        except Exception as e:
+                            logger.error(f"❌ Send error: {str(e)}")
+                            import traceback
+                            logger.error(f"📜 Traceback: {traceback.format_exc()}")
+                        
+                        # Clean up sent images immediately
+                        cleanup_images(send_batch)
+                        collected, objects_freed = force_garbage_collection()
+                        logger.info(f"🧹 Cleanup: {collected} collected, {objects_freed} freed | Pending: {len(success_images)}")
+                        
+                        await asyncio.sleep(SEND_DELAY)
                 
                 # Handle failed URLs - check retry count and ensure not already downloaded
                 for failed_url in failed_downloads:
@@ -1477,34 +1505,6 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                         if "message is not modified" not in str(e).lower():
                             logger.debug(f"Progress update skipped: {str(e)}")
                         pass
-                
-                # Send images if we have 10 or more
-                while len(success_images) >= 10:
-                    send_batch = success_images[:10]
-                    success_images = success_images[10:]
-                    
-                    logger.info(f"\n📤 ATTEMPTING TO SEND group of 10 images for {username}")
-                    logger.info(f"📊 Send batch details: {len(send_batch)} images, chat_id={chat_id}, topic={user_topic}")
-                    
-                    try:
-                        success = await send_image_batch_pyrogram(send_batch, username, chat_id, user_topic, batch_num)
-                        if success:
-                            total_sent += 10
-                            logger.info(f"✅ Successfully sent 10 images | Total sent: {total_sent}")
-                        else:
-                            logger.warning(f"⚠️ Failed to send batch - send function returned False")
-                    except Exception as e:
-                        logger.error(f"❌ Error sending batch: {str(e)}")
-                        import traceback
-                        logger.error(f"📜 Full traceback: {traceback.format_exc()}")
-                    
-                    # Clean up sent images and force GC
-                    cleanup_images(send_batch)
-                    collected, objects_freed = force_garbage_collection()
-                    logger.info(f"🧹 Memory cleanup: {collected} objects collected, {objects_freed} freed")
-                    log_memory()
-                    
-                    await asyncio.sleep(SEND_DELAY)
                 
                 batch_num += 1
                 
