@@ -47,19 +47,19 @@ threading.Thread(target=run_fastapi, daemon=True).start()
 # ⚙️ PERFORMANCE CONFIG
 # ───────────────────────────────
 # HTTP & Download Configuration
-MAX_CONCURRENT_WORKERS = 20      # Concurrent download workers
-DELAY_BETWEEN_REQUESTS = 0.05    # Delay between requests (seconds) - optimized
-TIMEOUT = 8.0                    # HTTP request timeout (seconds)
-MAX_DOWNLOAD_RETRIES = 2         # Download retry attempts per URL
-RETRY_DELAY = 0.5                # Delay between retries (seconds)
+MAX_CONCURRENT_WORKERS = 30      # Concurrent download workers - increased for speed
+DELAY_BETWEEN_REQUESTS = 0.03    # Delay between requests (seconds) - optimized for speed
+TIMEOUT = 12.0                   # HTTP request timeout (seconds) - increased for better success
+MAX_DOWNLOAD_RETRIES = 4         # Download retry attempts per URL - increased
+RETRY_DELAY = 0.8                # Delay between retries (seconds) - slightly increased
 
 # Batch Processing Configuration
-BATCH_SIZE = 30                  # URLs processed per download batch
-CHUNK_SIZE = 50                  # URLs per processing chunk - memory management
+BATCH_SIZE = 40                  # URLs processed per download batch - increased for speed
+CHUNK_SIZE = 60                  # URLs per processing chunk - increased for speed
 
 # Telegram Sending Configuration
-SEND_SEMAPHORE = asyncio.Semaphore(4)  # Concurrent sends - increased for speed
-SEND_DELAY = 0.2                 # Delay between sends (seconds) - optimized
+SEND_SEMAPHORE = asyncio.Semaphore(6)  # Concurrent sends - increased for speed
+SEND_DELAY = 0.15                # Delay between sends (seconds) - optimized for speed
 MEDIA_GROUP_SIZE = 10            # Images per media group (max 10 for Telegram)
 MAX_SEND_RETRIES = 3             # Send retry attempts per batch
 
@@ -83,8 +83,8 @@ MAX_ASPECT_RATIO = 50           # More lenient aspect ratio (was 20)
 
 # Memory Management Configuration
 TEMP_DIR_NAME = "temp_images"    # Temporary directory for downloads
-CONNECTION_POOL_SIZE = 50        # HTTP keepalive connections
-MAX_CONNECTIONS = 200            # Maximum HTTP connections
+CONNECTION_POOL_SIZE = 80        # HTTP keepalive connections - increased for speed
+MAX_CONNECTIONS = 300            # Maximum HTTP connections - increased for speed
 
 # Database Configuration
 DB_NAME = "bot_cache.db"         # SQLite database for caching and tracking
@@ -715,7 +715,23 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
         for attempt in range(1, max_retries + 1):
             try:
                 logger.info(f"📥 Attempt {attempt}/{max_retries} downloading: {url}")
-                r = await client.get(url, follow_redirects=True)
+                
+                # Use different timeout strategies for different attempts
+                timeout_multiplier = 1 + (attempt - 1) * 0.5  # Increase timeout on retries
+                current_timeout = TIMEOUT * timeout_multiplier
+                
+                # Create headers to mimic browser requests
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'DNT': '1',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+                
+                r = await client.get(url, follow_redirects=True, timeout=current_timeout, headers=headers)
                 
                 logger.info(f"📊 HTTP {r.status_code} - Content-Length: {len(r.content)} bytes - {url}")
                 
@@ -781,18 +797,48 @@ async def download_image_with_client(url, temp_dir, semaphore, client, max_retri
                     logger.warning(f"❌ 404 Not Found: {url}")
                     await update_url_download_status(url, 'failed', error_reason="404_not_found")
                     return None
+                elif r.status_code == 403:
+                    logger.warning(f"❌ 403 Forbidden: {url}")
+                    await update_url_download_status(url, 'failed', error_reason="403_forbidden")
+                    return None
+                elif r.status_code >= 500:
+                    if attempt == max_retries:
+                        logger.error(f"❌ Server Error {r.status_code} after {max_retries} attempts: {url}")
+                        await update_url_download_status(url, 'failed', error_reason=f"server_error_{r.status_code}")
+                        return None
+                    else:
+                        logger.warning(f"⚠️ Server Error {r.status_code} on attempt {attempt}, retrying: {url}")
                 else:
                     if attempt == max_retries:
                         logger.error(f"❌ HTTP {r.status_code} after {max_retries} attempts: {url}")
                         await update_url_download_status(url, 'failed', error_reason=f"http_{r.status_code}")
+                        return None
                     else:
                         logger.warning(f"⚠️ HTTP {r.status_code} on attempt {attempt}, retrying: {url}")
-            except Exception as e:
+                        
+            except asyncio.TimeoutError:
                 if attempt == max_retries:
-                    logger.error(f"❌ Download failed after {max_retries} attempts: {url} - {str(e)}")
-                    await update_url_download_status(url, 'failed', error_reason=str(e)[:200])
+                    logger.error(f"❌ Timeout after {max_retries} attempts: {url}")
+                    await update_url_download_status(url, 'failed', error_reason="timeout")
+                    return None
                 else:
-                    logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {str(e)}")
+                    logger.warning(f"⚠️ Timeout on attempt {attempt}, retrying with longer timeout: {url}")
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "connection" in error_msg or "network" in error_msg:
+                    if attempt == max_retries:
+                        logger.error(f"❌ Network error after {max_retries} attempts: {url} - {str(e)}")
+                        await update_url_download_status(url, 'failed', error_reason=f"network_error")
+                        return None
+                    else:
+                        logger.warning(f"⚠️ Network error on attempt {attempt}, retrying: {url}")
+                else:
+                    if attempt == max_retries:
+                        logger.error(f"❌ Download failed after {max_retries} attempts: {url} - {str(e)}")
+                        await update_url_download_status(url, 'failed', error_reason=str(e)[:200])
+                        return None
+                    else:
+                        logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {str(e)}")
             
             if attempt < max_retries:
                 logger.info(f"🔄 Retrying in {RETRY_DELAY}s: {url}")
@@ -999,7 +1045,7 @@ def cleanup_images(images):
         logger.debug(f"🧹 GC collected {collected} objects after file cleanup")
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
-    """Process all URLs with database-backed tracking for memory efficiency"""
+    """Process all URLs with database-backed tracking for memory efficiency and strict MEDIA_GROUP_SIZE=10"""
     import uuid
     session_id = str(uuid.uuid4())
     
@@ -1040,6 +1086,9 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     last_edit = [0]
     last_progress_percent = [0]
     batch_num = 1
+    
+    # Global accumulator for images per username - strict MEDIA_GROUP_SIZE enforcement
+    username_image_accumulators = {}
 
     # Process URLs in chunks using database tracking
     while True:
@@ -1066,40 +1115,48 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                 username_batches[username] = []
             username_batches[username].append(download)
 
-        # Send images immediately after downloading
+        # Accumulate images and send only when we have exactly MEDIA_GROUP_SIZE=10
         total_sent_this_batch = 0
-        for username, images in username_batches.items():
-            if images:
-                for i in range(0, len(images), MEDIA_GROUP_SIZE):
-                    batch_images = images[i:i + MEDIA_GROUP_SIZE]
-                    user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
-                    
-                    try:
-                        success = await send_image_batch_pyrogram(batch_images, username, chat_id, user_topic, batch_num)
-                        if success:
-                            total_sent_this_batch += len(batch_images)
-                            # Update send status in database
-                            for img in batch_images:
-                                await update_url_send_status(img['url'], 'completed')
-                            logger.info(f"✅ Sent {len(batch_images)} images for {username}")
-                        else:
-                            # Update send status as failed
-                            for img in batch_images:
-                                await update_url_send_status(img['url'], 'failed', 'send_failed')
-                            logger.warning(f"⚠️ Partial/failed send for {username} - continuing process")
-                        
-                        # Clean up images and force memory cleanup after each user batch
-                        cleanup_images(batch_images)
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Error sending {username} batch: {str(e)}")
+        for username, new_images in username_batches.items():
+            if username not in username_image_accumulators:
+                username_image_accumulators[username] = []
+            
+            # Add new images to accumulator
+            username_image_accumulators[username].extend(new_images)
+            
+            # Send in groups of exactly MEDIA_GROUP_SIZE (10)
+            while len(username_image_accumulators[username]) >= MEDIA_GROUP_SIZE:
+                batch_images = username_image_accumulators[username][:MEDIA_GROUP_SIZE]
+                username_image_accumulators[username] = username_image_accumulators[username][MEDIA_GROUP_SIZE:]
+                
+                user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+                
+                try:
+                    success = await send_image_batch_pyrogram(batch_images, username, chat_id, user_topic, batch_num)
+                    if success:
+                        total_sent_this_batch += len(batch_images)
+                        # Update send status in database
+                        for img in batch_images:
+                            await update_url_send_status(img['url'], 'completed')
+                        logger.info(f"✅ Sent {len(batch_images)} images for {username} (exact group of {MEDIA_GROUP_SIZE})")
+                    else:
                         # Update send status as failed
                         for img in batch_images:
-                            await update_url_send_status(img['url'], 'failed', str(e)[:200])
+                            await update_url_send_status(img['url'], 'failed', 'send_failed')
+                        logger.warning(f"⚠️ Partial/failed send for {username} - continuing process")
                     
-                    # Clean up immediately after sending
+                    # Clean up images and force memory cleanup after each user batch
                     cleanup_images(batch_images)
-                    await asyncio.sleep(SEND_DELAY)
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error sending {username} batch: {str(e)}")
+                    # Update send status as failed
+                    for img in batch_images:
+                        await update_url_send_status(img['url'], 'failed', str(e)[:200])
+                
+                # Clean up immediately after sending
+                cleanup_images(batch_images)
+                await asyncio.sleep(SEND_DELAY)
 
         # Update session progress
         session_stats = await get_session_stats(session_id)
@@ -1136,6 +1193,44 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         
         log_memory()
         logger.info(f"🧹 Batch cleanup: {collected} objects collected, {objects_freed} references freed")
+
+    # FINAL PROCESSING: Send remaining images (less than MEDIA_GROUP_SIZE) only at the very end
+    logger.info("🏁 Processing final remaining images...")
+    final_sent = 0
+    for username, remaining_images in username_image_accumulators.items():
+        if remaining_images:
+            logger.info(f"📤 Sending final {len(remaining_images)} images for {username} (less than {MEDIA_GROUP_SIZE})")
+            user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+            
+            try:
+                success = await send_image_batch_pyrogram(remaining_images, username, chat_id, user_topic, batch_num)
+                if success:
+                    final_sent += len(remaining_images)
+                    # Update send status in database
+                    for img in remaining_images:
+                        await update_url_send_status(img['url'], 'completed')
+                    logger.info(f"✅ Final send: {len(remaining_images)} images for {username}")
+                else:
+                    # Update send status as failed
+                    for img in remaining_images:
+                        await update_url_send_status(img['url'], 'failed', 'final_send_failed')
+                    logger.warning(f"⚠️ Final send failed for {username}")
+                
+                # Clean up images
+                cleanup_images(remaining_images)
+                
+            except Exception as e:
+                logger.error(f"❌ Error in final send for {username}: {str(e)}")
+                # Update send status as failed
+                for img in remaining_images:
+                    await update_url_send_status(img['url'], 'failed', str(e)[:200])
+    
+    # Update final send count
+    if final_sent > 0:
+        session_stats = await get_session_stats(session_id)
+        if session_stats:
+            total_urls, downloaded, sent, failed = session_stats
+            await update_session_progress(session_id, downloaded, sent + final_sent, failed)
 
     # Final session statistics
     final_stats = await get_session_stats(session_id)
