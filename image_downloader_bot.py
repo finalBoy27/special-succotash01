@@ -86,6 +86,11 @@ TEMP_DIR_NAME = "temp_images"    # Temporary directory for downloads
 CONNECTION_POOL_SIZE = 50        # HTTP keepalive connections
 MAX_CONNECTIONS = 200            # Maximum HTTP connections
 
+# Database Configuration
+DB_NAME = "bot_cache.db"         # SQLite database for caching and tracking
+DB_CACHE_EXPIRY = 24 * 60 * 60   # Cache expiry in seconds (24 hours)
+USE_DATABASE_TRACKING = True     # Enable database-based tracking for memory efficiency
+
 # Access Control
 ALLOWED_CHAT_IDS = {5809601894, 1285451259}
 
@@ -106,12 +111,59 @@ logging.getLogger('pyrogram').setLevel(logging.ERROR)  # Changed from WARNING to
 logging.getLogger('httpx').setLevel(logging.WARNING)  # Suppress HTTP logs
 
 def log_memory():
+    """Log detailed memory usage with garbage collection info"""
     try:
         import psutil
-        mem = psutil.Process().memory_info().rss / 1024 / 1024
-        logger.info(f"Memory usage: {mem:.2f} MB")
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        
+        # Get detailed memory statistics
+        rss_mb = memory_info.rss / 1024 / 1024  # Resident Set Size
+        vms_mb = memory_info.vms / 1024 / 1024  # Virtual Memory Size
+        
+        # Get garbage collection statistics
+        gc_stats = gc.get_stats()
+        gc_counts = gc.get_count()
+        
+        logger.info(f"💾 Memory: RSS={rss_mb:.2f}MB, VMS={vms_mb:.2f}MB | GC: {gc_counts} | Objects: {len(gc.get_objects())}")
+        
+        # Log detailed GC stats for each generation
+        for i, stats in enumerate(gc_stats):
+            if stats['collections'] > 0:
+                logger.debug(f"GC Gen{i}: {stats['collections']} collections, {stats['collected']} collected, {stats['uncollectable']} uncollectable")
+                
     except ImportError:
-        logger.info("psutil not available for memory tracking")
+        # Fallback to basic GC info without psutil
+        gc_counts = gc.get_count()
+        logger.info(f"💾 Memory tracking limited (no psutil) | GC: {gc_counts} | Objects: {len(gc.get_objects())}")
+
+def force_garbage_collection():
+    """Force aggressive garbage collection and log results"""
+    try:
+        # Get initial object count
+        initial_objects = len(gc.get_objects())
+        initial_counts = gc.get_count()
+        
+        # Force collection for all generations
+        collected = 0
+        for generation in range(3):
+            collected += gc.collect(generation)
+        
+        # Get final counts
+        final_objects = len(gc.get_objects())
+        final_counts = gc.get_count()
+        objects_freed = initial_objects - final_objects
+        
+        logger.info(f"🧹 GC: Collected {collected} objects, freed {objects_freed} references | {initial_counts} → {final_counts}")
+        
+        return collected, objects_freed
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Garbage collection error: {str(e)}")
+        # Fallback to basic collection
+        collected = gc.collect()
+        logger.info(f"🧹 GC: Basic collection freed {collected} objects")
+        return collected, 0
 
 def generate_bar(percentage):
     filled = int(percentage / 10)
@@ -119,13 +171,15 @@ def generate_bar(percentage):
     return "●" * filled + "○" * (empty // 2) + "◌" * (empty - empty // 2)
 
 def validate_image_for_telegram(filepath):
-    """Validate image dimensions and format for Telegram compatibility - PERMISSIVE MODE"""
+    """Validate image dimensions and format for Telegram compatibility - PERMISSIVE MODE with enhanced checking"""
     try:
         with Image.open(filepath) as img:
             width, height = img.size
             file_size = os.path.getsize(filepath)
             
-            # Only check absolute minimum requirements for Telegram
+            logger.debug(f"🔍 Validating: {width}x{height}, {file_size} bytes, format: {img.format}")
+            
+            # Check file size limits
             if file_size < MIN_IMAGE_SIZE:
                 logger.debug(f"Image too small: {file_size} bytes < {MIN_IMAGE_SIZE}")
                 return False, "file_too_small"
@@ -151,26 +205,47 @@ def validate_image_for_telegram(filepath):
                     logger.debug(f"Aspect ratio too extreme: {aspect_ratio}")
                     return False, "aspect_ratio_invalid"
             
-            # Accept most common image formats (don't be too strict)
-            supported_formats = ['JPEG', 'PNG', 'GIF', 'WEBP', 'BMP', 'TIFF', 'ICO']
-            if img.format and img.format not in supported_formats:
-                logger.debug(f"Potentially unsupported format: {img.format} - trying anyway")
-                # Don't reject, just log - let Telegram decide
+            # Enhanced format checking with better compatibility detection
+            if img.format:
+                # Check for problematic formats that often cause PHOTO_SAVE_FILE_INVALID
+                problematic_formats = ['WEBP', 'TIFF', 'BMP', 'ICO']
+                if img.format in problematic_formats:
+                    logger.debug(f"Potentially problematic format for Telegram: {img.format}")
+                    return False, "format_needs_conversion"
+                
+                # Check for formats that need special handling
+                if img.format in ['PNG'] and img.mode in ['RGBA', 'LA', 'P']:
+                    logger.debug(f"PNG with transparency/palette mode: {img.mode}")
+                    return False, "transparency_needs_conversion"
+                
+                # JPEG is generally safe, but check for CMYK or other exotic modes
+                if img.format == 'JPEG' and img.mode not in ['RGB', 'L']:
+                    logger.debug(f"JPEG with unsupported mode: {img.mode}")
+                    return False, "color_mode_needs_conversion"
+            
+            # Check for corrupted or unusual image data
+            try:
+                img.verify()
+            except Exception as e:
+                logger.debug(f"Image verification failed: {str(e)}")
+                return False, "image_corrupted"
             
             return True, "valid"
             
     except Exception as e:
         logger.debug(f"Image validation error for {filepath}: {str(e)}")
-        # Don't reject on validation errors - try to send anyway
-        return True, "validation_error_accepted"
+        # Don't reject on validation errors - but flag for conversion
+        return False, "validation_error_needs_conversion"
 
 def convert_image_for_telegram(filepath):
-    """Convert/optimize image for better Telegram compatibility"""
+    """Convert/optimize image for better Telegram compatibility with multiple strategies"""
     try:
         with Image.open(filepath) as img:
             # Get original info
             width, height = img.size
             file_size = os.path.getsize(filepath)
+            
+            logger.info(f"🔄 Converting image: {width}x{height}, {file_size} bytes, format: {img.format}")
             
             # Check if conversion is needed
             needs_conversion = False
@@ -182,47 +257,339 @@ def convert_image_for_telegram(filepath):
                 target_width = int(width * scale)
                 target_height = int(height * scale)
                 needs_conversion = True
-                logger.info(f"Resizing image from {width}x{height} to {target_width}x{target_height}")
+                logger.info(f"📏 Resizing from {width}x{height} to {target_width}x{target_height}")
             
             # If file is too large, we'll compress it
             if file_size > MAX_IMAGE_SIZE:
                 needs_conversion = True
-                logger.info(f"Compressing large image: {file_size} bytes")
+                logger.info(f"📦 Compressing large file: {file_size} bytes")
             
-            # Convert if needed
+            # Always convert to ensure Telegram compatibility
+            needs_conversion = True
+            
+            # Convert with multiple strategies
             if needs_conversion:
-                # Create new image
-                if target_width != width or target_height != height:
-                    img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                # Strategy 1: Try to preserve as much quality as possible
+                success = _try_conversion_strategy(img, filepath, target_width, target_height, file_size, strategy=1)
+                if success:
+                    return True
                 
-                # Convert to RGB if needed (for JPEG compatibility)
-                if img.mode in ('RGBA', 'LA', 'P'):
-                    background = Image.new('RGB', img.size, (255, 255, 255))
-                    if img.mode == 'P':
-                        img = img.convert('RGBA')
-                    background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                    img = background
+                # Strategy 2: More aggressive compression
+                logger.warning("🔄 First conversion failed, trying more aggressive compression")
+                success = _try_conversion_strategy(img, filepath, target_width, target_height, file_size, strategy=2)
+                if success:
+                    return True
                 
-                # Save with compression
-                quality = 85 if file_size > MAX_IMAGE_SIZE else 95
-                img.save(filepath, 'JPEG', quality=quality, optimize=True)
-                
-                new_size = os.path.getsize(filepath)
-                logger.info(f"Converted image: {file_size} -> {new_size} bytes")
-                
-                return True
+                # Strategy 3: Very aggressive - minimal quality but guaranteed compatibility
+                logger.warning("🔄 Second conversion failed, trying maximum compression")
+                success = _try_conversion_strategy(img, filepath, target_width, target_height, file_size, strategy=3)
+                if success:
+                    return True
             
-            return False  # No conversion needed
+            return False  # No conversion needed or all strategies failed
             
     except Exception as e:
-        logger.warning(f"Image conversion failed for {filepath}: {str(e)}")
+        logger.error(f"❌ Image conversion failed for {filepath}: {str(e)}")
         return False
+
+def _try_conversion_strategy(img, filepath, target_width, target_height, original_size, strategy=1):
+    """Try different conversion strategies with increasing aggressiveness"""
+    try:
+        # Create a copy to work with
+        working_img = img.copy()
+        
+        # Resize if needed
+        if target_width != img.width or target_height != img.height:
+            working_img = working_img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+        
+        # Convert to RGB for maximum compatibility
+        if working_img.mode in ('RGBA', 'LA', 'P', 'CMYK'):
+            if working_img.mode == 'P':
+                working_img = working_img.convert('RGBA')
+            
+            # Create white background
+            background = Image.new('RGB', working_img.size, (255, 255, 255))
+            if working_img.mode in ('RGBA', 'LA'):
+                background.paste(working_img, mask=working_img.split()[-1])
+            else:
+                background.paste(working_img)
+            working_img = background
+        elif working_img.mode != 'RGB':
+            working_img = working_img.convert('RGB')
+        
+        # Set quality based on strategy
+        if strategy == 1:
+            quality = 95 if original_size < MAX_IMAGE_SIZE else 85
+            optimize = True
+        elif strategy == 2:
+            quality = 75
+            optimize = True
+            # Additional size reduction if still too large
+            if original_size > MAX_IMAGE_SIZE // 2:
+                new_width = int(target_width * 0.8)
+                new_height = int(target_height * 0.8)
+                working_img = working_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        else:  # strategy == 3
+            quality = 60
+            optimize = True
+            # Aggressive size reduction
+            new_width = min(int(target_width * 0.6), 1920)
+            new_height = min(int(target_height * 0.6), 1080)
+            working_img = working_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Save with specified quality
+        working_img.save(filepath, 'JPEG', quality=quality, optimize=optimize, progressive=True)
+        
+        new_size = os.path.getsize(filepath)
+        logger.info(f"✅ Strategy {strategy} successful: {original_size} → {new_size} bytes (Q{quality})")
+        
+        # Validate the result
+        if new_size > MAX_IMAGE_SIZE:
+            logger.warning(f"⚠️ File still too large after conversion: {new_size} bytes")
+            if strategy < 3:
+                return False  # Try next strategy
+        
+        return True
+        
+    except Exception as e:
+        logger.warning(f"⚠️ Conversion strategy {strategy} failed: {str(e)}")
+        return False
+
+# ───────────────────────────────
+# 🗄️ DATABASE FUNCTIONS
+# ───────────────────────────────
+async def init_database():
+    """Initialize SQLite database with required tables"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        # URL tracking table for download/send status
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS url_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE NOT NULL,
+                username TEXT NOT NULL,
+                download_status TEXT DEFAULT 'pending',
+                send_status TEXT DEFAULT 'pending',
+                file_path TEXT,
+                file_size INTEGER,
+                error_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Media data cache table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS media_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url_hash TEXT UNIQUE NOT NULL,
+                media_data TEXT NOT NULL,
+                usernames TEXT NOT NULL,
+                year_counts TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Processing sessions table
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS processing_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT UNIQUE NOT NULL,
+                total_urls INTEGER,
+                downloaded INTEGER DEFAULT 0,
+                sent INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create indexes for better performance
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_url_tracking_url ON url_tracking(url)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_url_tracking_status ON url_tracking(download_status, send_status)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_media_cache_hash ON media_cache(url_hash)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_sessions_id ON processing_sessions(session_id)')
+        
+        await db.commit()
+        logger.info("📁 Database initialized successfully")
+
+async def cache_media_data(url, media_data, usernames, year_counts):
+    """Cache extracted media data to avoid reprocessing"""
+    import hashlib
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO media_cache 
+            (url_hash, media_data, usernames, year_counts, created_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (
+            url_hash,
+            json.dumps(media_data),
+            json.dumps(usernames),
+            json.dumps(year_counts) if year_counts else None
+        ))
+        await db.commit()
+
+async def get_cached_media_data(url):
+    """Retrieve cached media data if available and not expired"""
+    import hashlib
+    url_hash = hashlib.md5(url.encode()).hexdigest()
+    
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute('''
+            SELECT media_data, usernames, year_counts, created_at 
+            FROM media_cache 
+            WHERE url_hash = ? AND 
+                  created_at > datetime('now', '-{} seconds')
+        '''.format(DB_CACHE_EXPIRY), (url_hash,))
+        
+        row = await cursor.fetchone()
+        if row:
+            media_data = json.loads(row[0])
+            usernames = json.loads(row[1])
+            year_counts = json.loads(row[2]) if row[2] else {}
+            logger.info(f"📁 Using cached media data for: {url}")
+            return media_data, usernames, year_counts
+    
+    return None, None, None
+
+async def create_processing_session(session_id, total_urls):
+    """Create a new processing session"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            INSERT OR REPLACE INTO processing_sessions 
+            (session_id, total_urls, created_at, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ''', (session_id, total_urls))
+        await db.commit()
+
+async def update_session_progress(session_id, downloaded=None, sent=None, failed=None):
+    """Update processing session progress"""
+    updates = []
+    params = []
+    
+    if downloaded is not None:
+        updates.append("downloaded = ?")
+        params.append(downloaded)
+    if sent is not None:
+        updates.append("sent = ?")
+        params.append(sent)
+    if failed is not None:
+        updates.append("failed = ?")
+        params.append(failed)
+    
+    if updates:
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(session_id)
+        
+        async with aiosqlite.connect(DB_NAME) as db:
+            await db.execute(f'''
+                UPDATE processing_sessions 
+                SET {", ".join(updates)}
+                WHERE session_id = ?
+            ''', params)
+            await db.commit()
+
+async def batch_insert_urls(urls_data, session_id):
+    """Efficiently insert multiple URLs for tracking"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.executemany('''
+            INSERT OR IGNORE INTO url_tracking 
+            (url, username, download_status, created_at, updated_at)
+            VALUES (?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ''', urls_data)
+        await db.commit()
+
+async def get_pending_urls(limit=None):
+    """Get URLs that need to be downloaded"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        query = '''
+            SELECT id, url, username 
+            FROM url_tracking 
+            WHERE download_status = 'pending'
+            ORDER BY created_at
+        '''
+        if limit:
+            query += f' LIMIT {limit}'
+            
+        cursor = await db.execute(query)
+        return await cursor.fetchall()
+
+async def update_url_download_status(url, status, file_path=None, file_size=None, error_reason=None):
+    """Update download status for a URL"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            UPDATE url_tracking 
+            SET download_status = ?, file_path = ?, file_size = ?, 
+                error_reason = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE url = ?
+        ''', (status, file_path, file_size, error_reason, url))
+        await db.commit()
+
+async def update_url_send_status(url, status, error_reason=None):
+    """Update send status for a URL"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            UPDATE url_tracking 
+            SET send_status = ?, error_reason = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE url = ?
+        ''', (status, error_reason, url))
+        await db.commit()
+
+async def get_downloaded_images_by_username(username, limit=None):
+    """Get downloaded images for a specific username"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        query = '''
+            SELECT url, file_path, file_size 
+            FROM url_tracking 
+            WHERE username = ? AND download_status = 'completed' AND send_status = 'pending'
+            ORDER BY updated_at
+        '''
+        if limit:
+            query += f' LIMIT {limit}'
+            
+        cursor = await db.execute(query, (username,))
+        rows = await cursor.fetchall()
+        return [{'url': row[0], 'path': row[1], 'size': row[2]} for row in rows]
+
+async def get_session_stats(session_id):
+    """Get current session statistics"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute('''
+            SELECT total_urls, downloaded, sent, failed 
+            FROM processing_sessions 
+            WHERE session_id = ?
+        ''', (session_id,))
+        return await cursor.fetchone()
+
+async def cleanup_old_cache():
+    """Clean up expired cache entries"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            DELETE FROM media_cache 
+            WHERE created_at < datetime('now', '-{} seconds')
+        '''.format(DB_CACHE_EXPIRY * 2))  # Clean entries older than 2x expiry
+        
+        # Clean up old completed sessions (keep for 7 days)
+        await db.execute('''
+            DELETE FROM processing_sessions 
+            WHERE status = 'completed' AND 
+                  updated_at < datetime('now', '-7 days')
+        ''')
+        
+        await db.commit()
 
 # ───────────────────────────────
 # 🧩 UTILITIES
 # ───────────────────────────────
 async def fetch_html(url: str):
     try:
+        # Check cache first
+        cached_data, cached_usernames, cached_year_counts = await get_cached_media_data(url)
+        if cached_data:
+            return None  # Will be handled by extract_media_data_from_html_cached
+            
         async with httpx.AsyncClient() as client:
             r = await client.get(url, follow_redirects=True, timeout=TIMEOUT)
             return r.text if r.status_code == 200 else ""
@@ -230,9 +597,22 @@ async def fetch_html(url: str):
         logger.error(f"Fetch error for {url}: {e}")
         return ""
 
-def extract_media_data_from_html(html_str: str):
-    """Extract mediaData, usernames, yearCounts from HTML"""
+def extract_media_data_from_html(html_str: str, source_url: str = None):
+    """Extract mediaData, usernames, yearCounts from HTML with caching"""
     try:
+        # Check cache first if we have a source URL
+        if source_url:
+            cached_data, cached_usernames, cached_year_counts = None, None, None
+            try:
+                import asyncio
+                cached_data, cached_usernames, cached_year_counts = asyncio.run(get_cached_media_data(source_url))
+            except:
+                pass
+            
+            if cached_data:
+                logger.info(f"📁 Using cached data for {source_url}")
+                return cached_data, cached_usernames, cached_year_counts
+
         tree = HTMLParser(html_str)
         script_tags = tree.css("script")
         media_data = {}
@@ -257,6 +637,14 @@ def extract_media_data_from_html(html_str: str):
                 if match:
                     year_counts = json.loads(match.group(1))
 
+        # Cache the results if we have a source URL
+        if source_url and media_data:
+            try:
+                import asyncio
+                asyncio.run(cache_media_data(source_url, media_data, usernames, year_counts))
+            except:
+                pass
+        
         return media_data, usernames, year_counts
     except Exception as e:
         logger.error(f"Error extracting media data: {str(e)}")
@@ -320,72 +708,94 @@ async def download_batch(urls, temp_dir, base_timeout=TIMEOUT):
     return successful, failed
 
 async def download_image_with_client(url, temp_dir, semaphore, client, max_retries=MAX_DOWNLOAD_RETRIES):
-    """Download single image using provided client - memory efficient"""
+    """Download single image using provided client - memory efficient with detailed logging"""
     async with semaphore:
         await asyncio.sleep(DELAY_BETWEEN_REQUESTS)
         
         for attempt in range(1, max_retries + 1):
             try:
+                logger.info(f"📥 Attempt {attempt}/{max_retries} downloading: {url}")
                 r = await client.get(url, follow_redirects=True)
+                
+                logger.info(f"📊 HTTP {r.status_code} - Content-Length: {len(r.content)} bytes - {url}")
+                
                 if r.status_code == 200:
                     content = r.content
-                    if len(content) > MIN_IMAGE_SIZE:
+                    content_size = len(content)
+                    
+                    if content_size > MIN_IMAGE_SIZE:
                         # Use a more unique filename to avoid conflicts
                         timestamp = int(time.time() * 1000000)
-                        size = len(content)
-                        filename = f"img_{timestamp}_{size}_{hash(url) % 10000}.jpg"
+                        filename = f"img_{timestamp}_{content_size}_{hash(url) % 10000}.jpg"
                         filepath = os.path.join(temp_dir, filename)
                         
                         # Write file efficiently
                         with open(filepath, 'wb') as f:
                             f.write(content)
                         
+                        logger.info(f"✅ Downloaded successfully: {content_size} bytes → {filepath}")
+                        
                         # Clear content from memory immediately
                         del content
                         
                         # Validate and convert image for Telegram compatibility
                         is_valid, reason = validate_image_for_telegram(filepath)
-                        if not is_valid and reason not in ["validation_error_accepted"]:
+                        if not is_valid:
                             # Try to convert/fix the image
-                            logger.info(f"Attempting to convert invalid image ({reason}): {url}")
+                            logger.warning(f"🔄 Converting invalid image ({reason}): {url}")
                             converted = convert_image_for_telegram(filepath)
                             if converted:
                                 # Re-validate after conversion
                                 is_valid, new_reason = validate_image_for_telegram(filepath)
                                 if is_valid:
-                                    logger.info(f"✅ Image conversion successful: {url}")
+                                    new_size = os.path.getsize(filepath)
+                                    logger.info(f"✅ Image conversion successful: {content_size} → {new_size} bytes")
+                                    # Update database with successful download
+                                    await update_url_download_status(url, 'completed', filepath, new_size)
                                 else:
-                                    logger.warning(f"❌ Image conversion failed ({new_reason}): {url}")
+                                    logger.error(f"❌ Image conversion failed ({new_reason}): {url}")
+                                    await update_url_download_status(url, 'failed', error_reason=new_reason)
                                     try:
                                         os.remove(filepath)
                                     except:
                                         pass
                                     return None
                             else:
-                                logger.warning(f"❌ Cannot convert image ({reason}): {url}")
+                                logger.error(f"❌ Cannot convert image ({reason}): {url}")
+                                await update_url_download_status(url, 'failed', error_reason=reason)
                                 try:
                                     os.remove(filepath)
                                 except:
                                     pass
                                 return None
+                        else:
+                            # Update database with successful download
+                            await update_url_download_status(url, 'completed', filepath, os.path.getsize(filepath))
                         
                         return {'url': url, 'path': filepath, 'size': os.path.getsize(filepath)}
                     else:
-                        logger.debug(f"Image too small ({len(content)} bytes): {url}")
+                        logger.warning(f"⚠️ Image too small ({content_size} bytes < {MIN_IMAGE_SIZE}): {url}")
+                        await update_url_download_status(url, 'failed', error_reason=f"image_too_small_{content_size}_bytes")
                         return None
                 elif r.status_code == 404:
-                    logger.debug(f"404 Not Found: {url}")
+                    logger.warning(f"❌ 404 Not Found: {url}")
+                    await update_url_download_status(url, 'failed', error_reason="404_not_found")
                     return None
                 else:
                     if attempt == max_retries:
-                        logger.debug(f"HTTP {r.status_code} for {url}")
+                        logger.error(f"❌ HTTP {r.status_code} after {max_retries} attempts: {url}")
+                        await update_url_download_status(url, 'failed', error_reason=f"http_{r.status_code}")
+                    else:
+                        logger.warning(f"⚠️ HTTP {r.status_code} on attempt {attempt}, retrying: {url}")
             except Exception as e:
                 if attempt == max_retries:
-                    logger.debug(f"Download failed for {url}: {str(e)}")
+                    logger.error(f"❌ Download failed after {max_retries} attempts: {url} - {str(e)}")
+                    await update_url_download_status(url, 'failed', error_reason=str(e)[:200])
                 else:
-                    logger.debug(f"Download attempt {attempt} failed for {url}")
+                    logger.warning(f"⚠️ Download attempt {attempt} failed: {url} - {str(e)}")
             
             if attempt < max_retries:
+                logger.info(f"🔄 Retrying in {RETRY_DELAY}s: {url}")
                 await asyncio.sleep(RETRY_DELAY)
         
         return None
@@ -455,11 +865,11 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
                             
                         # Try one more conversion attempt if needed
                         is_valid, reason = validate_image_for_telegram(img['path'])
-                        if not is_valid and reason not in ["validation_error_accepted"]:
-                            logger.info(f"Final conversion attempt ({reason}): {img['path']}")
+                        if not is_valid:
+                            logger.warning(f"🔄 Final conversion attempt ({reason}): {img['path']}")
                             converted = convert_image_for_telegram(img['path'])
                             if not converted:
-                                logger.warning(f"Final validation failed ({reason}): {img['path']}")
+                                logger.warning(f"❌ Final validation failed ({reason}): {img['path']}")
                                 continue
                             
                         if i == 0:
@@ -547,95 +957,119 @@ async def send_image_batch_pyrogram(images, username, chat_id, topic_id=None, ba
 
     # Return True if at least some chunks were successful
     success_rate = successful_chunks / total_chunks if total_chunks > 0 else 0
+    
+    # Log memory usage before cleanup
     logger.info(f"📊 {username}: {successful_chunks}/{total_chunks} chunks sent successfully ({success_rate:.1%})")
+    log_memory()
+    
+    # Force garbage collection after sending to free up memory
+    collected, objects_freed = force_garbage_collection()
+    
+    # Log memory usage after cleanup
+    log_memory()
+    logger.info(f"🧹 Post-send cleanup: {collected} objects collected, {objects_freed} references freed")
+    
     return success_rate > 0
 
 def cleanup_images(images):
-    """Remove temp image files with error handling"""
+    """Remove temp image files with error handling and memory cleanup"""
     if not images:
         return
     
+    cleaned_files = 0
     for img in images:
         try:
             if isinstance(img, dict) and 'path' in img and os.path.exists(img['path']):
                 os.remove(img['path'])
+                cleaned_files += 1
             elif isinstance(img, str) and os.path.exists(img):
                 os.remove(img)
+                cleaned_files += 1
         except Exception as e:
             logger.debug(f"Cleanup error for {img}: {str(e)}")
     
     # Clear the list to free memory references
     if isinstance(images, list):
         images.clear()
+    
+    # Force garbage collection after cleanup
+    if cleaned_files > 0:
+        logger.debug(f"🧹 Cleaned {cleaned_files} image files, forcing GC")
+        collected = gc.collect()
+        logger.debug(f"🧹 GC collected {collected} objects after file cleanup")
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
-    """Process all URLs with better memory management and no image loss"""
+    """Process all URLs with database-backed tracking for memory efficiency"""
+    import uuid
+    session_id = str(uuid.uuid4())
+    
+    # Initialize database
+    await init_database()
+    await cleanup_old_cache()
+    
     total_images = sum(len(urls) for urls in username_images.values())
-    total_downloaded = 0
-    total_sent = 0
-
     temp_dir = "temp_images"
     os.makedirs(temp_dir, exist_ok=True)
 
-    # Collect all unique URLs with tracking
+    # Prepare URLs for database insertion
     all_urls = []
-    url_to_username = {}  # Track which username each URL belongs to
+    urls_data = []
     for username, urls in username_images.items():
         for url in urls:
-            if url not in url_to_username:  # Avoid duplicates
-                all_urls.append(url)
-                url_to_username[url] = username
+            all_urls.append(url)
+            urls_data.append((url, username))
 
-    downloaded_urls = set()
-    failed_urls = []
-    successfully_sent_urls = set()
+    # Remove duplicates while preserving order and username mapping
+    seen_urls = set()
+    unique_urls_data = []
+    for url, username in urls_data:
+        if url not in seen_urls:
+            seen_urls.add(url)
+            unique_urls_data.append((url, username))
+
+    total_unique_urls = len(unique_urls_data)
+    logger.info(f"📊 Starting database-tracked download of {total_unique_urls} unique URLs from {len(username_images)} users")
     
+    # Log initial memory state
+    log_memory()
+
+    # Create processing session and insert URLs into database
+    await create_processing_session(session_id, total_unique_urls)
+    await batch_insert_urls(unique_urls_data, session_id)
+
     last_edit = [0]
     last_progress_percent = [0]
     batch_num = 1
 
-    logger.info(f"📊 Starting download of {len(all_urls)} unique URLs from {len(username_images)} users")
-
-    # Process URLs in manageable chunks
-    url_index = 0
-    
-    while url_index < len(all_urls) or failed_urls:
-        # Get current chunk of URLs to process
-        current_urls = []
-        if url_index < len(all_urls):
-            take = min(CHUNK_SIZE, len(all_urls) - url_index)
-            current_urls = all_urls[url_index:url_index + take]
-            url_index += take
-        elif failed_urls:
-            # Process failed URLs in smaller batches
-            take = min(20, len(failed_urls))
-            current_urls = failed_urls[:take]
-            failed_urls = failed_urls[take:]
-
-        if not current_urls:
+    # Process URLs in chunks using database tracking
+    while True:
+        # Get pending URLs from database
+        pending_urls = await get_pending_urls(CHUNK_SIZE)
+        if not pending_urls:
             break
 
-        # Download current chunk
+        current_urls = [row[1] for row in pending_urls]  # Extract URLs
+        
         logger.info(f"📥 Downloading batch {batch_num}: {len(current_urls)} URLs")
-        successful_downloads, new_failures = await download_batch(current_urls, temp_dir)
+        successful_downloads, failed_downloads = await download_batch(current_urls, temp_dir)
         
-        # Track what failed for retry
-        failed_urls.extend(new_failures)
-        
-        # Group successful downloads by username
-        username_groups = {}
+        # Process successful downloads by username using database
+        username_batches = {}
         for download in successful_downloads:
-            username = url_to_username.get(download['url'], 'unknown')
-            if username not in username_groups:
-                username_groups[username] = []
-            username_groups[username].append(download)
-            downloaded_urls.add(download['url'])
+            # Get username from database
+            async with aiosqlite.connect(DB_NAME) as db:
+                cursor = await db.execute('SELECT username FROM url_tracking WHERE url = ?', (download['url'],))
+                row = await cursor.fetchone()
+                username = row[0] if row else 'unknown'
+            
+            if username not in username_batches:
+                username_batches[username] = []
+            username_batches[username].append(download)
 
-        # Send images immediately after downloading to free memory
-        send_success_count = 0
-        for username, images in username_groups.items():
+        # Send images immediately after downloading
+        total_sent_this_batch = 0
+        for username, images in username_batches.items():
             if images:
-                # Split large groups into batches using configurable size
                 for i in range(0, len(images), MEDIA_GROUP_SIZE):
                     batch_images = images[i:i + MEDIA_GROUP_SIZE]
                     user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
@@ -643,94 +1077,94 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
                     try:
                         success = await send_image_batch_pyrogram(batch_images, username, chat_id, user_topic, batch_num)
                         if success:
-                            send_success_count += len(batch_images)
-                            successfully_sent_urls.update(img['url'] for img in batch_images)
+                            total_sent_this_batch += len(batch_images)
+                            # Update send status in database
+                            for img in batch_images:
+                                await update_url_send_status(img['url'], 'completed')
                             logger.info(f"✅ Sent {len(batch_images)} images for {username}")
                         else:
+                            # Update send status as failed
+                            for img in batch_images:
+                                await update_url_send_status(img['url'], 'failed', 'send_failed')
                             logger.warning(f"⚠️ Partial/failed send for {username} - continuing process")
+                        
+                        # Clean up images and force memory cleanup after each user batch
+                        cleanup_images(batch_images)
+                        
                     except Exception as e:
                         logger.error(f"❌ Error sending {username} batch: {str(e)}")
+                        # Update send status as failed
+                        for img in batch_images:
+                            await update_url_send_status(img['url'], 'failed', str(e)[:200])
                     
                     # Clean up immediately after sending
                     cleanup_images(batch_images)
-                    
-                    # Small delay to prevent rate limits
                     await asyncio.sleep(SEND_DELAY)
 
-        total_downloaded += len(successful_downloads)
-        total_sent += send_success_count
-        batch_num += 1
-
-        # Update progress
-        now = time.time()
-        progress_percent = int((total_downloaded / len(all_urls)) * 100) if all_urls else 100
-        if (now - last_edit[0] > 10) or (progress_percent - last_progress_percent[0] >= 5):
-            bar = generate_bar(progress_percent)
-            progress = f"Batch {batch_num-1} ✅\n{bar} {progress_percent}%\n📥 Downloaded: {total_downloaded}\n📤 Sent: {total_sent}\n❌ Failed: {len(failed_urls)}"
-            if progress_msg:
-                try:
-                    await progress_msg.edit(progress)
-                except:
-                    pass
-            last_edit[0] = now
-            last_progress_percent[0] = progress_percent
-
-        # Memory cleanup after each batch
-        del successful_downloads, username_groups
-        gc.collect()
-
-    # Final retry for remaining failed URLs
-    if failed_urls:
-        logger.info(f"🔄 Final retry for {len(failed_urls)} failed URLs")
-        retry_successful, still_failed = await download_batch(failed_urls[:20], temp_dir)  # Limit final retry
-        
-        if retry_successful:
-            # Group and send retry downloads
-            username_groups = {}
-            for download in retry_successful:
-                username = url_to_username.get(download['url'], 'unknown')
-                if username not in username_groups:
-                    username_groups[username] = []
-                username_groups[username].append(download)
-                downloaded_urls.add(download['url'])
-
-            for username, images in username_groups.items():
-                for i in range(0, len(images), MEDIA_GROUP_SIZE):
-                    batch_images = images[i:i + MEDIA_GROUP_SIZE]
-                    user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+        # Update session progress
+        session_stats = await get_session_stats(session_id)
+        if session_stats:
+            total_urls, downloaded, sent, failed = session_stats
+            new_downloaded = downloaded + len(successful_downloads)
+            new_sent = sent + total_sent_this_batch
+            new_failed = failed + len(failed_downloads)
+            
+            await update_session_progress(session_id, new_downloaded, new_sent, new_failed)
+            
+            # Update progress message
+            progress_percent = int((new_downloaded / total_urls) * 100) if total_urls > 0 else 100
+            now = time.time()
+            if (now - last_edit[0] > 10) or (progress_percent - last_progress_percent[0] >= 5):
+                bar = generate_bar(progress_percent)
+                progress = f"Batch {batch_num} ✅\n{bar} {progress_percent}%\n📥 Downloaded: {new_downloaded}\n📤 Sent: {new_sent}\n❌ Failed: {new_failed}"
+                if progress_msg:
                     try:
-                        success = await send_image_batch_pyrogram(batch_images, username, chat_id, user_topic, batch_num)
-                        if success:
-                            total_sent += len(batch_images)
-                            successfully_sent_urls.update(img['url'] for img in batch_images)
-                        else:
-                            logger.warning(f"⚠️ Partial/failed retry send for {username}")
-                    except Exception as e:
-                        logger.error(f"❌ Retry send error for {username}: {str(e)}")
-                    cleanup_images(batch_images)
+                        await progress_msg.edit(progress)
+                    except:
+                        pass
+                last_edit[0] = now
+                last_progress_percent[0] = progress_percent
 
-            total_downloaded += len(retry_successful)
+        batch_num += 1
+        
+        # Memory cleanup after each batch
+        logger.info(f"🧹 Batch {batch_num-1} complete, cleaning up memory...")
+        log_memory()
+        
+        del successful_downloads, username_batches
+        collected, objects_freed = force_garbage_collection()
+        
+        log_memory()
+        logger.info(f"🧹 Batch cleanup: {collected} objects collected, {objects_freed} references freed")
 
+    # Final session statistics
+    final_stats = await get_session_stats(session_id)
+    if final_stats:
+        total_urls, downloaded, sent, failed = final_stats
+        logger.info(f"📊 Final Database Stats: {downloaded} downloaded, {sent} sent, {failed} failed out of {total_urls} total")
+    
+    # Final memory cleanup and logging
+    logger.info(f"🏁 Process completed! Final cleanup...")
+    log_memory()
+    
     # Final cleanup
     try:
         await aioshutil.rmtree(temp_dir)
+        logger.info(f"🗂️ Removed temporary directory: {temp_dir}")
     except:
         pass
 
-    # Verify no images were missed
-    expected_urls = set(all_urls)
-    missing_urls = expected_urls - downloaded_urls
-    unsent_urls = downloaded_urls - successfully_sent_urls
-    
-    if missing_urls:
-        logger.warning(f"⚠️ {len(missing_urls)} URLs failed to download completely")
-    if unsent_urls:
-        logger.warning(f"⚠️ {len(unsent_urls)} downloaded images failed to send")
-    
-    logger.info(f"📊 Final Stats: {total_downloaded} downloaded, {total_sent} sent, {len(missing_urls)} failed")
-    gc.collect()
+    # Mark session as completed
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('UPDATE processing_sessions SET status = ? WHERE session_id = ?', ('completed', session_id))
+        await db.commit()
 
-    return total_downloaded, total_sent, len(all_urls)
+    # Final aggressive garbage collection
+    collected, objects_freed = force_garbage_collection()
+    log_memory()
+    logger.info(f"🏁 Final cleanup: {collected} objects collected, {objects_freed} references freed")
+
+    return downloaded if final_stats else 0, sent if final_stats else 0, total_urls if final_stats else len(unique_urls_data)
 
 # ───────────────────────────────
 # ✅ FIXED TOPIC CREATION FUNCTION
@@ -863,7 +1297,7 @@ async def handle_down(client: Client, message: Message):
         return
 
     # Extract data
-    media_data, usernames, year_counts = extract_media_data_from_html(html_content)
+    media_data, usernames, year_counts = extract_media_data_from_html(html_content, url if url else urls[0] if 'urls' in locals() and urls else None)
     if not media_data:
         await message.reply("Failed to extract media data from HTML.")
         return
