@@ -1045,7 +1045,14 @@ def cleanup_images(images):
         logger.debug(f"🧹 GC collected {collected} objects after file cleanup")
 
 async def process_batches(username_images, chat_id, topic_id=None, user_topic_ids=None, progress_msg=None):
-    """Process all URLs with database-backed tracking for memory efficiency and strict MEDIA_GROUP_SIZE=10"""
+    """
+    NEW LOGIC: Process URLs in batches of 10 with retry mechanism
+    - Process 10 URLs at a time with retries
+    - Failed URLs go to retry queue (max 2 attempts per URL total)
+    - Send images in groups of 10 when accumulated >= 10
+    - Clear memory after each send
+    - Process one username completely before moving to next
+    """
     import uuid
     session_id = str(uuid.uuid4())
     
@@ -1053,194 +1060,162 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
     await init_database()
     await cleanup_old_cache()
     
-    total_images = sum(len(urls) for urls in username_images.values())
     temp_dir = "temp_images"
     os.makedirs(temp_dir, exist_ok=True)
-
-    # Prepare URLs for database insertion
-    all_urls = []
-    urls_data = []
-    for username, urls in username_images.items():
-        for url in urls:
-            all_urls.append(url)
-            urls_data.append((url, username))
-
-    # Remove duplicates while preserving order and username mapping
-    seen_urls = set()
-    unique_urls_data = []
-    for url, username in urls_data:
-        if url not in seen_urls:
-            seen_urls.add(url)
-            unique_urls_data.append((url, username))
-
-    total_unique_urls = len(unique_urls_data)
-    logger.info(f"📊 Starting database-tracked download of {total_unique_urls} unique URLs from {len(username_images)} users")
+    
+    # Track progress
+    total_downloaded = 0
+    total_sent = 0
+    total_failed_permanently = 0
+    last_edit = [0]
+    batch_num = 1
     
     # Log initial memory state
     log_memory()
-
-    # Create processing session and insert URLs into database
-    await create_processing_session(session_id, total_unique_urls)
-    await batch_insert_urls(unique_urls_data, session_id)
-
-    last_edit = [0]
-    last_progress_percent = [0]
-    batch_num = 1
+    logger.info(f"🚀 Starting NEW batch processing logic for {len(username_images)} users")
     
-    # Global accumulator for images per username - strict MEDIA_GROUP_SIZE enforcement
-    username_image_accumulators = {}
-
-    # Process URLs in chunks using database tracking
-    while True:
-        # Get pending URLs from database
-        pending_urls = await get_pending_urls(CHUNK_SIZE)
-        if not pending_urls:
-            break
-
-        current_urls = [row[1] for row in pending_urls]  # Extract URLs
+    # Process each username one by one
+    for user_idx, (username, urls) in enumerate(username_images.items(), 1):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"👤 Processing User {user_idx}/{len(username_images)}: {username}")
+        logger.info(f"📊 Total URLs for this user: {len(urls)}")
+        logger.info(f"{'='*60}\n")
         
-        logger.info(f"📥 Downloading batch {batch_num}: {len(current_urls)} URLs")
-        successful_downloads, failed_downloads = await download_batch(current_urls, temp_dir)
+        # URLs for this user
+        pending_urls = list(urls)  # Main queue
+        failed_urls = []  # Failed URLs queue (for retry)
+        retry_count = {}  # Track retry attempts per URL
         
-        # Process successful downloads by username using database
-        username_batches = {}
-        for download in successful_downloads:
-            # Get username from database
-            async with aiosqlite.connect(DB_NAME) as db:
-                cursor = await db.execute('SELECT username FROM url_tracking WHERE url = ?', (download['url'],))
-                row = await cursor.fetchone()
-                username = row[0] if row else 'unknown'
+        # Success image accumulator for this user
+        success_images = []
+        
+        # Get topic for this user
+        user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+        
+        # Phase 1: Process all pending URLs in batches of 10
+        round_num = 1
+        while pending_urls or failed_urls:
             
-            if username not in username_batches:
-                username_batches[username] = []
-            username_batches[username].append(download)
-
-        # Accumulate images and send only when we have exactly MEDIA_GROUP_SIZE=10
-        total_sent_this_batch = 0
-        for username, new_images in username_batches.items():
-            if username not in username_image_accumulators:
-                username_image_accumulators[username] = []
+            # Determine which queue to process
+            if pending_urls:
+                current_queue = pending_urls
+                queue_name = "PENDING"
+            elif failed_urls:
+                current_queue = failed_urls
+                queue_name = "RETRY"
+                failed_urls = []  # Clear retry queue, failed ones will be added back
+            else:
+                break
             
-            # Add new images to accumulator
-            username_image_accumulators[username].extend(new_images)
+            logger.info(f"\n🔄 Round {round_num} - Processing {queue_name} queue")
+            logger.info(f"📝 Queue size: {len(current_queue)} URLs")
             
-            # Send in groups of exactly MEDIA_GROUP_SIZE (10)
-            while len(username_image_accumulators[username]) >= MEDIA_GROUP_SIZE:
-                batch_images = username_image_accumulators[username][:MEDIA_GROUP_SIZE]
-                username_image_accumulators[username] = username_image_accumulators[username][MEDIA_GROUP_SIZE:]
+            # Process in batches of 10
+            while current_queue:
+                # Take first 10 URLs
+                batch_urls = current_queue[:10]
+                current_queue = current_queue[10:]
                 
-                user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+                logger.info(f"\n📦 Batch {batch_num} - Processing {len(batch_urls)} URLs from {queue_name}")
                 
-                try:
-                    success = await send_image_batch_pyrogram(batch_images, username, chat_id, user_topic, batch_num)
-                    if success:
-                        total_sent_this_batch += len(batch_images)
-                        # Update send status in database
-                        for img in batch_images:
-                            await update_url_send_status(img['url'], 'completed')
-                        logger.info(f"✅ Sent {len(batch_images)} images for {username} (exact group of {MEDIA_GROUP_SIZE})")
+                # Download batch with retries
+                successful_downloads, failed_downloads = await download_batch(batch_urls, temp_dir)
+                
+                success_count = len(successful_downloads)
+                failed_count = len(failed_downloads)
+                
+                logger.info(f"✅ Success: {success_count}/{len(batch_urls)}")
+                logger.info(f"❌ Failed: {failed_count}/{len(batch_urls)}")
+                
+                # Add successful downloads to accumulator
+                success_images.extend(successful_downloads)
+                total_downloaded += success_count
+                
+                # Handle failed URLs - check retry count
+                for failed_url in failed_downloads:
+                    if failed_url not in retry_count:
+                        retry_count[failed_url] = 0
+                    
+                    retry_count[failed_url] += 1
+                    
+                    if retry_count[failed_url] < 2:  # Max 2 attempts (1 original + 1 retry)
+                        logger.info(f"🔄 URL will be retried (attempt {retry_count[failed_url]}/2): {failed_url}")
+                        failed_urls.append(failed_url)
                     else:
-                        # Update send status as failed
-                        for img in batch_images:
-                            await update_url_send_status(img['url'], 'failed', 'send_failed')
-                        logger.warning(f"⚠️ Partial/failed send for {username} - continuing process")
-                    
-                    # Clean up images and force memory cleanup after each user batch
-                    cleanup_images(batch_images)
-                    
-                except Exception as e:
-                    logger.error(f"❌ Error sending {username} batch: {str(e)}")
-                    # Update send status as failed
-                    for img in batch_images:
-                        await update_url_send_status(img['url'], 'failed', str(e)[:200])
+                        logger.warning(f"❌ URL permanently failed after 2 attempts: {failed_url}")
+                        total_failed_permanently += 1
                 
-                # Clean up immediately after sending
-                cleanup_images(batch_images)
-                await asyncio.sleep(SEND_DELAY)
-
-        # Update session progress
-        session_stats = await get_session_stats(session_id)
-        if session_stats:
-            total_urls, downloaded, sent, failed = session_stats
-            new_downloaded = downloaded + len(successful_downloads)
-            new_sent = sent + total_sent_this_batch
-            new_failed = failed + len(failed_downloads)
-            
-            await update_session_progress(session_id, new_downloaded, new_sent, new_failed)
-            
-            # Update progress message
-            progress_percent = int((new_downloaded / total_urls) * 100) if total_urls > 0 else 100
-            now = time.time()
-            if (now - last_edit[0] > 10) or (progress_percent - last_progress_percent[0] >= 5):
-                bar = generate_bar(progress_percent)
-                progress = f"Batch {batch_num} ✅\n{bar} {progress_percent}%\n📥 Downloaded: {new_downloaded}\n📤 Sent: {new_sent}\n❌ Failed: {new_failed}"
-                if progress_msg:
+                # Update progress
+                now = time.time()
+                if progress_msg and (now - last_edit[0] > 5):
+                    progress = f"""👤 User: {username} ({user_idx}/{len(username_images)})
+📦 Batch: {batch_num} | Round: {round_num}
+📥 Downloaded: {total_downloaded}
+📤 Sent: {total_sent}
+💾 Pending Send: {len(success_images)}
+❌ Failed: {total_failed_permanently}
+🔄 Retry Queue: {len(failed_urls)}"""
                     try:
                         await progress_msg.edit(progress)
                     except:
                         pass
-                last_edit[0] = now
-                last_progress_percent[0] = progress_percent
-
-        batch_num += 1
+                    last_edit[0] = now
+                
+                # Send images if we have 10 or more
+                while len(success_images) >= 10:
+                    send_batch = success_images[:10]
+                    success_images = success_images[10:]
+                    
+                    logger.info(f"\n📤 Sending group of 10 images for {username}")
+                    
+                    try:
+                        success = await send_image_batch_pyrogram(send_batch, username, chat_id, user_topic, batch_num)
+                        if success:
+                            total_sent += 10
+                            logger.info(f"✅ Successfully sent 10 images | Total sent: {total_sent}")
+                        else:
+                            logger.warning(f"⚠️ Failed to send batch")
+                    except Exception as e:
+                        logger.error(f"❌ Error sending batch: {str(e)}")
+                    
+                    # Clean up sent images and force GC
+                    cleanup_images(send_batch)
+                    collected, objects_freed = force_garbage_collection()
+                    logger.info(f"🧹 Memory cleanup: {collected} objects collected, {objects_freed} freed")
+                    log_memory()
+                    
+                    await asyncio.sleep(SEND_DELAY)
+                
+                batch_num += 1
+                
+                # Batch cleanup
+                logger.info(f"🧹 Batch {batch_num-1} complete, cleaning memory...")
+                collected, objects_freed = force_garbage_collection()
+                log_memory()
+            
+            round_num += 1
         
-        # Memory cleanup after each batch
-        logger.info(f"🧹 Batch {batch_num-1} complete, cleaning up memory...")
-        log_memory()
-        
-        del successful_downloads, username_batches
-        collected, objects_freed = force_garbage_collection()
-        
-        log_memory()
-        logger.info(f"🧹 Batch cleanup: {collected} objects collected, {objects_freed} references freed")
-
-    # FINAL PROCESSING: Send remaining images (less than MEDIA_GROUP_SIZE) only at the very end
-    logger.info("🏁 Processing final remaining images...")
-    final_sent = 0
-    for username, remaining_images in username_image_accumulators.items():
-        if remaining_images:
-            logger.info(f"📤 Sending final {len(remaining_images)} images for {username} (less than {MEDIA_GROUP_SIZE})")
-            user_topic = user_topic_ids.get(username) if user_topic_ids else topic_id
+        # Send remaining images for this user (less than 10)
+        if success_images:
+            logger.info(f"\n📤 Sending final {len(success_images)} images for {username}")
             
             try:
-                success = await send_image_batch_pyrogram(remaining_images, username, chat_id, user_topic, batch_num)
+                success = await send_image_batch_pyrogram(success_images, username, chat_id, user_topic, batch_num)
                 if success:
-                    final_sent += len(remaining_images)
-                    # Update send status in database
-                    for img in remaining_images:
-                        await update_url_send_status(img['url'], 'completed')
-                    logger.info(f"✅ Final send: {len(remaining_images)} images for {username}")
-                else:
-                    # Update send status as failed
-                    for img in remaining_images:
-                        await update_url_send_status(img['url'], 'failed', 'final_send_failed')
-                    logger.warning(f"⚠️ Final send failed for {username}")
-                
-                # Clean up images
-                cleanup_images(remaining_images)
-                
+                    total_sent += len(success_images)
+                    logger.info(f"✅ Sent final batch | Total sent: {total_sent}")
             except Exception as e:
-                logger.error(f"❌ Error in final send for {username}: {str(e)}")
-                # Update send status as failed
-                for img in remaining_images:
-                    await update_url_send_status(img['url'], 'failed', str(e)[:200])
-    
-    # Update final send count
-    if final_sent > 0:
-        session_stats = await get_session_stats(session_id)
-        if session_stats:
-            total_urls, downloaded, sent, failed = session_stats
-            await update_session_progress(session_id, downloaded, sent + final_sent, failed)
-
-    # Final session statistics
-    final_stats = await get_session_stats(session_id)
-    if final_stats:
-        total_urls, downloaded, sent, failed = final_stats
-        logger.info(f"📊 Final Database Stats: {downloaded} downloaded, {sent} sent, {failed} failed out of {total_urls} total")
-    
-    # Final memory cleanup and logging
-    logger.info(f"🏁 Process completed! Final cleanup...")
-    log_memory()
+                logger.error(f"❌ Error sending final batch: {str(e)}")
+            
+            # Cleanup
+            cleanup_images(success_images)
+            success_images.clear()
+            collected, objects_freed = force_garbage_collection()
+            logger.info(f"🧹 Final user cleanup: {collected} objects collected, {objects_freed} freed")
+            log_memory()
+        
+        logger.info(f"\n✅ Completed user: {username}")
+        logger.info(f"{'='*60}\n")
     
     # Final cleanup
     try:
@@ -1248,18 +1223,20 @@ async def process_batches(username_images, chat_id, topic_id=None, user_topic_id
         logger.info(f"🗂️ Removed temporary directory: {temp_dir}")
     except:
         pass
-
-    # Mark session as completed
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('UPDATE processing_sessions SET status = ? WHERE session_id = ?', ('completed', session_id))
-        await db.commit()
-
-    # Final aggressive garbage collection
+    
+    # Final memory cleanup
     collected, objects_freed = force_garbage_collection()
     log_memory()
     logger.info(f"🏁 Final cleanup: {collected} objects collected, {objects_freed} references freed")
-
-    return downloaded if final_stats else 0, sent if final_stats else 0, total_urls if final_stats else len(unique_urls_data)
+    
+    logger.info(f"\n{'='*60}")
+    logger.info(f"📊 FINAL STATISTICS:")
+    logger.info(f"✅ Total Downloaded: {total_downloaded}")
+    logger.info(f"📤 Total Sent: {total_sent}")
+    logger.info(f"❌ Total Failed Permanently: {total_failed_permanently}")
+    logger.info(f"{'='*60}\n")
+    
+    return total_downloaded, total_sent, total_downloaded + total_failed_permanently
 
 # ───────────────────────────────
 # ✅ FIXED TOPIC CREATION FUNCTION
