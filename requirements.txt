@@ -8,3 +8,4 @@ aioshutil
 psutil
 TgCrypto
 Pillow
+imageio
